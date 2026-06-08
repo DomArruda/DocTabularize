@@ -1,0 +1,1863 @@
+"""
+================================================================================
+CORE ENTERPRISE DOCUMENT INTELLIGENCE REFINERY v2.0
+Hierarchical Configuration | Genetic Schema Evolution | JIT Compilation
+================================================================================
+Modular Splitting Map:
+- Section 1: HIERARCHICAL_CONFIG    -> config.py
+- Section 2: DATA_MODELS            -> models.py
+- Section 3: INGESTION_CLUSTERING   -> cluster_engine.py
+- Section 4: SCHEMA_DISCOVERY       -> schema_discovery.py
+- Section 5: VERIFICATION_ENGINE    -> verifier.py
+- Section 6: JIT_OPTIMIZATION       -> jit_compiler.py
+- Section 7: AGENT_ORCHESTRATOR     -> orchestrator.py
+================================================================================
+"""
+
+import os
+import io
+import json
+import math
+import base64
+import logging
+import tempfile
+import traceback
+import sys
+import time
+import functools
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Any, Tuple, Dict, List, Callable, Union
+from contextlib import contextmanager
+
+import numpy as np
+import faiss
+import umap
+import hdbscan
+import duckdb
+import fitz
+import xgboost as xgb
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.cross_encoder import CrossEncoder
+from openai import OpenAI, APIError, APITimeoutError, APIConnectionError
+from pydantic import BaseModel, Field, ValidationError
+
+# Python 3.11+ Native TOML parsing
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        raise ImportError("Please run 'pip install tomli' for Python < 3.11")
+
+# ---------------------------------------------------------------------------
+# LOGGING SETUP (no emoji) — deferred to HierarchicalConfig._setup_logging()
+# ---------------------------------------------------------------------------
+log = logging.getLogger("DocumentRefinery")
+
+
+# ==============================================================================
+# RETRY DECORATOR for flaky API calls
+# ==============================================================================
+def retry_on_failure(max_retries: int = 3, delay: float = 2.0, backoff: float = 2.0):
+    """Decorator that retries a function on exception with exponential backoff."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            current_delay = delay
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (APITimeoutError, APIConnectionError) as e:
+                    last_exception = e
+                    log.warning("  [WARN] Transient error in %s (attempt %d/%d): %s",
+                                func.__name__, attempt, max_retries, e)
+                    if attempt < max_retries:
+                        time.sleep(current_delay)
+                        current_delay *= backoff
+                except Exception as e:
+                    raise e
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+# ==============================================================================
+# SECTION 1: HIERARCHICAL CONFIGURATION SYSTEM
+# ==============================================================================
+
+class FieldConfig(BaseModel):
+    """Schema-level field definition with validation constraints."""
+    type: str = "string"
+    required: bool = True
+    description: Optional[str] = None
+    validation: Optional[str] = None   # regex:..., email, range, etc.
+    format: Optional[str] = None       # date/datetime format
+    enum: Optional[List[str]] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    max_length: Optional[int] = None
+
+
+class SchemaLevelConfig(BaseModel):
+    """Table-level configuration bound to a specific cluster."""
+    name: str
+    cluster_id: int
+    parent_schema_id: Optional[str] = None
+    enabled: bool = True
+    fields: Dict[str, FieldConfig] = Field(default_factory=dict)
+    validation: Dict[str, Any] = Field(default_factory=dict)
+    extraction: Dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def table_name(self) -> str:
+        return self.extraction.get("table_name", self.name)
+
+    @property
+    def prompt_injection(self) -> Optional[str]:
+        return self.extraction.get("prompt_injection")
+
+    @property
+    def max_rows(self) -> Optional[int]:
+        return self.extraction.get("max_rows")
+
+
+class ClusterLevelConfig(BaseModel):
+    """Per-cluster overrides. Omitted fields inherit from JobLevelConfig."""
+    id: int
+    name: Optional[str] = None
+    enabled: bool = True
+    granularity: str = "medium"
+    hdbscan_min_cluster: Optional[int] = None
+    hdbscan_min_samples: Optional[int] = None
+    samples_per_cluster: Optional[int] = None
+    target_score: Optional[float] = None
+    max_page_retries: Optional[int] = None
+    extract_dpi: Optional[int] = None
+    enable_fact_verification: Optional[bool] = None
+    custom_prompt_injection: Optional[str] = None
+    schema_overrides: List[str] = Field(default_factory=list)
+
+
+class JobLevelConfig(BaseModel):
+    """Per-execution behavioral policy."""
+    target_score: float = 85.0
+    max_page_retries: int = 3
+    max_cluster_retries: int = 2
+    enable_fact_verification: bool = False
+    enable_schema_evolution: bool = True
+    schema_evolution_top_k: int = 3
+    jit_warmup_jobs: int = 10
+    jit_error_tolerance: float = 15.0
+    extraction: Dict[str, Any] = Field(default_factory=dict)
+    clustering: Dict[str, Any] = Field(default_factory=dict)
+    jit: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PipelineLevelConfig(BaseModel):
+    """Global infrastructure and I/O configuration."""
+    name: str = "document_refinery"
+    version: str = "2.0.0"
+    doc_path: str = ""
+    output_path: str = "master_output.json"
+    error_log_path: Optional[str] = None
+    cache_path: Optional[str] = None
+    schema_db_path: Optional[str] = None
+    ollama_json_mode: str = "json"   # "json_schema" | "json" | "legacy"
+    models: Dict[str, str] = Field(default_factory=dict)
+    logging: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ResolvedClusterConfig:
+    """Runtime-resolved configuration for a single cluster.
+
+    Merges JobLevelConfig defaults with ClusterLevelConfig overrides.
+    """
+    def __init__(self, cluster: ClusterLevelConfig, job: JobLevelConfig):
+        self.cluster_id = cluster.id
+        self.name = cluster.name or f"cluster_{cluster.id}"
+        self.enabled = cluster.enabled
+        self.granularity = cluster.granularity
+
+        # Cluster overrides Job where explicitly provided
+        self.hdbscan_min_cluster = (
+            cluster.hdbscan_min_cluster
+            if cluster.hdbscan_min_cluster is not None
+            else job.clustering.get("hdbscan_min_cluster", 3)
+        )
+        self.hdbscan_min_samples = (
+            cluster.hdbscan_min_samples
+            if cluster.hdbscan_min_samples is not None
+            else job.clustering.get("hdbscan_min_samples", 2)
+        )
+        self.samples_per_cluster = (
+            cluster.samples_per_cluster
+            if cluster.samples_per_cluster is not None
+            else job.clustering.get("samples_per_cluster", 3)
+        )
+        self.target_score = (
+            cluster.target_score if cluster.target_score is not None else job.target_score
+        )
+        self.max_page_retries = (
+            cluster.max_page_retries if cluster.max_page_retries is not None else job.max_page_retries
+        )
+        self.extract_dpi = (
+            cluster.extract_dpi if cluster.extract_dpi is not None else job.extraction.get("extract_dpi", 150)
+        )
+        self.enable_fact_verification = (
+            cluster.enable_fact_verification
+            if cluster.enable_fact_verification is not None
+            else job.enable_fact_verification
+        )
+        self.custom_prompt_injection = cluster.custom_prompt_injection or ""
+        self.schema_overrides = cluster.schema_overrides
+
+        # Job-level only (no cluster override)
+        self.max_cluster_retries = job.max_cluster_retries
+        self.enable_schema_evolution = job.enable_schema_evolution
+        self.schema_evolution_top_k = job.schema_evolution_top_k
+        self.jit_warmup_jobs = job.jit.get("sequential_jobs_before_jit", job.jit_warmup_jobs)
+        self.jit_error_tolerance = job.jit.get("error_tolerance", job.jit_error_tolerance)
+        self.max_rows_per_cluster = job.extraction.get("max_rows_per_cluster", 100)
+        self.max_tables_per_cluster = job.extraction.get("max_tables_per_cluster", 5)
+        self.target_features = job.extraction.get("target_features", 8)
+        self.umap_components = job.clustering.get("umap_components", 5)
+        self.umap_neighbors = job.clustering.get("umap_neighbors", 15)
+        self.umap_min_dist = job.clustering.get("umap_min_dist", 0.1)
+
+
+class HierarchicalConfig:
+    """Parses and resolves the four-tier TOML configuration hierarchy."""
+
+    def __init__(self, toml_path: str = "pipeline_config.toml"):
+        self.toml_path = Path(toml_path)
+        if not self.toml_path.exists():
+            log.warning("Configuration file '%s' not found. Generating production defaults.", toml_path)
+            self._generate_default_toml(self.toml_path)
+
+        with open(self.toml_path, "rb") as f:
+            raw = tomllib.load(f)
+
+        self.pipeline = PipelineLevelConfig(**raw.get("pipeline", {}))
+        self.job = JobLevelConfig(**raw.get("job", {}))
+
+        # Parse clusters (array-of-tables)
+        self.clusters: Dict[int, ClusterLevelConfig] = {}
+        for c_raw in raw.get("cluster", []):
+            c = ClusterLevelConfig(**c_raw)
+            self.clusters[c.id] = c
+
+        # Parse schemas (array-of-tables)
+        self.schemas: Dict[str, SchemaLevelConfig] = {}
+        for s_raw in raw.get("schema", []):
+            s = SchemaLevelConfig(**s_raw)
+            self.schemas[s.name] = s
+
+        self._resolve_paths()
+        self._setup_logging()
+
+        log.info("[CONFIG] Hierarchical config loaded: %d clusters, %d schemas",
+                 len(self.clusters), len(self.schemas))
+
+    def _resolve_paths(self):
+        """Resolve relative paths against the TOML file location."""
+        base = self.toml_path.parent
+        for attr in ["output_path", "error_log_path", "cache_path", "schema_db_path", "doc_path"]:
+            val = getattr(self.pipeline, attr)
+            if val and not Path(val).is_absolute():
+                setattr(self.pipeline, attr, str(base / val))
+
+    def _setup_logging(self):
+        """Configure logging from pipeline.logging settings."""
+        log_cfg = self.pipeline.logging
+        level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
+        fmt = log_cfg.get("format", "%(asctime)s [%(levelname)s] %(message)s")
+        handlers = []
+        if "console" in log_cfg.get("handlers", ["console"]):
+            handlers.append(logging.StreamHandler(sys.stdout))
+        if "file" in log_cfg.get("handlers", []):
+            err_path = Path(self.pipeline.error_log_path or tempfile.gettempdir())
+            err_path.parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.FileHandler(err_path, mode="a", encoding="utf-8"))
+
+        logging.basicConfig(level=level, format=fmt, handlers=handlers)
+        log.info("[CONFIG] Logging initialized at level %s", logging.getLevelName(level))
+
+    def get_cluster_config(self, cluster_id: int) -> ResolvedClusterConfig:
+        """Resolve runtime configuration for a specific cluster."""
+        cluster = self.clusters.get(cluster_id, ClusterLevelConfig(id=cluster_id))
+        return ResolvedClusterConfig(cluster, self.job)
+
+    def get_schemas_for_cluster(self, cluster_id: int) -> List[SchemaLevelConfig]:
+        """Return enabled schemas bound to a specific cluster."""
+        return [s for s in self.schemas.values() if s.cluster_id == cluster_id and s.enabled]
+
+    def get_schema(self, name: str) -> Optional[SchemaLevelConfig]:
+        return self.schemas.get(name)
+
+    def _generate_default_toml(self, path: Path):
+        default = """[pipeline]
+doc_path = ""
+output_path = "master_output.json"
+ollama_json_mode = "json"
+
+[pipeline.models]
+embedding_model = "all-MiniLM-L6-v2"
+cross_encoder_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+ollama_url = "http://localhost:11434/v1"
+schema_model = "qwen2.5-vl:7b"
+vision_model = "qwen2.5-vl:7b"
+
+[pipeline.logging]
+level = "INFO"
+format = "%(asctime)s [%(levelname)s] %(message)s"
+handlers = ["console", "file"]
+
+[job]
+target_score = 85.0
+max_page_retries = 3
+max_cluster_retries = 2
+enable_fact_verification = false
+enable_schema_evolution = true
+schema_evolution_top_k = 3
+
+[job.extraction]
+target_features = 8
+max_rows_per_cluster = 100
+max_tables_per_cluster = 5
+extract_dpi = 150
+
+[job.clustering]
+umap_components = 5
+umap_neighbors = 15
+umap_min_dist = 0.1
+hdbscan_min_cluster = 3
+hdbscan_min_samples = 2
+samples_per_cluster = 3
+
+[job.jit]
+sequential_jobs_before_jit = 10
+error_tolerance = 15.0
+"""
+        path.write_text(default, encoding="utf-8")
+
+
+# ==============================================================================
+# SECTION 2: DATA_MODELS
+# ==============================================================================
+
+class Chunk:
+    def __init__(self, chunk_id: int, page_num: int, text: str, source: str):
+        self.chunk_id = chunk_id
+        self.page_num = page_num
+        self.text = text
+        self.source = source
+        self.embedding: Optional[np.ndarray] = None
+        self.umap_coords: Optional[np.ndarray] = None
+        self.cluster_id: Optional[int] = None
+
+
+class ClusterSchema(BaseModel):
+    granularity: str = Field(description="coarse | medium | fine")
+    rationale: str = Field(description="Reasoning for structural fields selection")
+    schema_fields: Dict[str, str] = Field(description="Flat mapping of field_name -> data type/desc. MUST NOT NEST LISTS.")
+    parent_schema_id: Optional[str] = Field(default=None, description="ID of parent schema if this is a mutation")
+    source: str = Field(default="discovered", description="discovered | config | evolved")
+
+
+class ExtractedTable(BaseModel):
+    table_name: str
+    rows: List[Dict[str, Any]] = Field(description="List of raw flat dictionaries containing rows conforming to schema fields.")
+
+
+class PageExtractionResult(BaseModel):
+    reasoning: str = Field(description="Self-reflective assessment of formatting adaptations implemented.")
+    tables: List[ExtractedTable]
+
+
+class MetaStateJSON(BaseModel):
+    task: str = "Heuristic_VL_Extraction"
+    cluster_id: int
+    page_num: int
+    current_retry: int
+    max_retries: int
+    cumulative_tables: int
+    cumulative_rows: int
+    global_parse_failure_rate: float
+    total_global_attempts: int
+    historical_errors_from_previous_calls: List[str]
+    previous_score: float = 0.0
+    previous_feedback: str = ""
+
+
+class GlobalCache(BaseModel):
+    total_attempts: int = 0
+    total_parse_failures: int = 0
+    recent_errors: List[str] = Field(default_factory=list)
+    max_error_memory: int = 3
+
+
+# ==============================================================================
+# SECTION 3: INGESTION_CLUSTERING
+# ==============================================================================
+
+@contextmanager
+def open_pdf(path: str):
+    """Context manager ensuring fitz Document is properly closed."""
+    doc = fitz.open(path)
+    try:
+        yield doc
+    finally:
+        doc.close()
+        log.debug("[INGEST] PDF document closed.")
+
+
+def ingest_document(path: str) -> List[Chunk]:
+    """Ingest a PDF or text file, returning Chunk objects."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Target process file does not exist: {p.absolute()}")
+
+    log.info("[INGEST] Ingesting document: %s", p.name)
+    if p.suffix.lower() == ".pdf":
+        try:
+            with open_pdf(path) as doc:
+                chunks = []
+                for page_num in range(len(doc)):
+                    try:
+                        text = doc[page_num].get_text("text").strip()
+                        if len(text) < 15:
+                            log.debug("  Skipping page %d: insufficient text (%d chars)", page_num, len(text))
+                            continue
+                        chunks.append(Chunk(chunk_id=len(chunks), page_num=page_num, text=text, source=path))
+                    except Exception as e:
+                        log.error("  [FAIL] Error extracting text from page %d: %s", page_num, e)
+                        log.error(traceback.format_exc())
+                log.info("  [OK] Ingested %d pages from PDF.", len(chunks))
+                return chunks
+        except Exception as e:
+            log.error("  [FAIL] Fatal error opening PDF: %s", e)
+            raise
+    else:
+        try:
+            text = p.read_text(encoding="utf-8")
+            words = text.split()
+            chunks = [Chunk(chunk_id=i, page_num=i, text=" ".join(words[i:i+400]), source=path)
+                      for i in range(0, len(words), 400)]
+            log.info("  [OK] Ingested %d chunks from text file.", len(chunks))
+            return chunks
+        except Exception as e:
+            log.error("  [FAIL] Error reading text file: %s", e)
+            raise
+
+
+def execute_embedding_generation(chunks: List[Chunk], model_name: str) -> List[Chunk]:
+    """Generate embeddings for all chunks."""
+    log.info("[EMBED] Generating embeddings...")
+    try:
+        model = SentenceTransformer(model_name)
+        embeddings = model.encode([c.text for c in chunks], show_progress_bar=False, batch_size=32)
+        for chunk, emb in zip(chunks, embeddings):
+            chunk.embedding = emb
+        log.info("  [OK] Generated %d embeddings (dim=%d).", len(embeddings), embeddings.shape[1])
+        return chunks
+    except Exception as e:
+        log.error("  [FAIL] Embedding generation failed: %s", e)
+        log.error(traceback.format_exc())
+        raise
+
+
+def run_manifold_reduction(chunks: List[Chunk], cfg: ResolvedClusterConfig) -> List[Chunk]:
+    """Reduce embeddings to lower-dimensional manifold."""
+    log.info("[UMAP] Running UMAP manifold reduction...")
+    try:
+        matrix = np.vstack([c.embedding for c in chunks])
+        reducer = umap.UMAP(
+            n_components=cfg.umap_components, n_neighbors=cfg.umap_neighbors,
+            min_dist=cfg.umap_min_dist, metric="cosine", random_state=42
+        )
+        coords_matrix = reducer.fit_transform(matrix)
+        for chunk, coords in zip(chunks, coords_matrix):
+            chunk.umap_coords = coords
+        log.info("  [OK] Reduced to %d dimensions.", cfg.umap_components)
+        return chunks
+    except Exception as e:
+        log.error("  [FAIL] UMAP reduction failed: %s", e)
+        log.error(traceback.format_exc())
+        raise
+
+
+def generate_spatial_density_clusters(chunks: List[Chunk], cfg: ResolvedClusterConfig) -> Dict[int, int]:
+    """Cluster chunks using HDBSCAN with per-cluster resolved config."""
+    log.info("[CLUSTER] Clustering with HDBSCAN (min_cluster=%d, min_samples=%d)...",
+             cfg.hdbscan_min_cluster, cfg.hdbscan_min_samples)
+    try:
+        matrix = np.vstack([c.umap_coords for c in chunks])
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=cfg.hdbscan_min_cluster, min_samples=cfg.hdbscan_min_samples,
+            metric="euclidean", cluster_selection_method="eom"
+        )
+        labels = clusterer.fit_predict(matrix)
+        stats: Dict[int, int] = {}
+        for chunk, label in zip(chunks, labels):
+            chunk.cluster_id = int(label)
+            stats[int(label)] = stats.get(int(label), 0) + 1
+
+        valid_clusters = {k: v for k, v in stats.items() if k != -1}
+        log.info("  [OK] Found %d clusters (+ %d noise points).", len(valid_clusters), stats.get(-1, 0))
+        for cid, count in valid_clusters.items():
+            log.info("     Cluster %d: %d pages", cid, count)
+        return stats
+    except Exception as e:
+        log.error("  [FAIL] Clustering failed: %s", e)
+        log.error(traceback.format_exc())
+        raise
+
+
+def isolate_medoid_samples(chunks: List[Chunk], cfg: ResolvedClusterConfig) -> Dict[int, List[Chunk]]:
+    """Select medoid (central) samples from each cluster using FAISS."""
+    log.info("[MEDOID] Selecting medoid samples...")
+    samples = {}
+    valid_cids = sorted(set(c.cluster_id for c in chunks if c.cluster_id != -1))
+    for cid in valid_cids:
+        try:
+            members = [c for c in chunks if c.cluster_id == cid]
+            coords = np.vstack([c.umap_coords for c in members]).astype("float32")
+            index = faiss.IndexFlatL2(coords.shape[1])
+            index.add(coords)
+            _, idx = index.search(coords.mean(axis=0, keepdims=True),
+                                  min(cfg.samples_per_cluster, len(members)))
+            samples[cid] = [members[i] for i in idx[0]]
+            log.info("  Cluster %d: selected %d medoid samples.", cid, len(samples[cid]))
+        except Exception as e:
+            log.error("  [FAIL] Medoid sampling failed for cluster %d: %s", cid, e)
+            log.error(traceback.format_exc())
+    return samples
+
+
+# ==============================================================================
+# SECTION 4: SCHEMA_DISCOVERY + GENETIC EVOLUTION MEMORY
+# ==============================================================================
+
+class SchemaRegistry:
+    """Persistent DuckDB-backed registry for schema performance tracking."""
+
+    def __init__(self, db_path: Path):
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.db = duckdb.connect(str(db_path))
+            self._init_tables()
+            log.info("[REGISTRY] Schema registry initialized at %s", db_path)
+        except Exception as e:
+            log.error("[FAIL] Failed to initialize schema registry: %s", e)
+            raise
+
+    def _init_tables(self):
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS schema_registry (
+                schema_id VARCHAR PRIMARY KEY,
+                cluster_id INTEGER,
+                schema_json JSON,
+                granularity VARCHAR,
+                avg_extraction_score FLOAT,
+                total_rows_extracted INTEGER,
+                parent_schema_id VARCHAR,
+                run_timestamp TIMESTAMP,
+                doc_source VARCHAR,
+                survival_generation INTEGER DEFAULT 1
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS schema_lineage (
+                lineage_id VARCHAR PRIMARY KEY,
+                ancestor_schema_id VARCHAR,
+                descendant_schema_id VARCHAR,
+                mutation_description VARCHAR,
+                score_delta FLOAT
+            )
+        """)
+
+    def register_schema(self, schema_id: str, cluster_id: int, schema: ClusterSchema,
+                        avg_score: float, total_rows: int, doc_source: str,
+                        parent_schema_id: Optional[str] = None):
+        try:
+            schema_json = schema.model_dump_json()
+            self.db.execute("""
+                INSERT OR REPLACE INTO schema_registry
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?,
+                    COALESCE((SELECT survival_generation FROM schema_registry WHERE schema_id = ?), 1))
+            """, [schema_id, cluster_id, schema_json, schema.granularity,
+                  avg_score, total_rows, parent_schema_id, doc_source, schema_id])
+            log.info("  [REGISTER] Registered schema %s (score: %.1f)", schema_id, avg_score)
+        except Exception as e:
+            log.error("  [FAIL] Failed to register schema %s: %s", schema_id, e)
+
+    def get_top_schemas(self, cluster_id: int, top_k: int = 3) -> List[Dict]:
+        try:
+            result = self.db.execute("""
+                SELECT schema_id, schema_json, avg_extraction_score, granularity, survival_generation
+                FROM schema_registry
+                WHERE cluster_id = ?
+                ORDER BY avg_extraction_score DESC
+                LIMIT ?
+            """, [cluster_id, top_k]).fetchall()
+
+            schemas = []
+            for row in result:
+                schemas.append({
+                    "schema_id": row[0],
+                    "schema": json.loads(row[1]),
+                    "score": row[2],
+                    "granularity": row[3],
+                    "generation": row[4]
+                })
+            return schemas
+        except Exception as e:
+            log.error("  [FAIL] Failed to retrieve top schemas: %s", e)
+            return []
+
+    def generate_schema_id(self, cluster_id: int, parent_id: Optional[str] = None) -> str:
+        gen = 1
+        if parent_id:
+            existing = self.db.execute(
+                "SELECT survival_generation FROM schema_registry WHERE schema_id = ?",
+                [parent_id]
+            ).fetchone()
+            if existing:
+                gen = existing[0] + 1
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        return f"schema_c{cluster_id}_g{gen}_{timestamp}"
+
+
+def _convert_config_schema_to_cluster_schema(s_cfg: SchemaLevelConfig) -> ClusterSchema:
+    """Convert a SchemaLevelConfig (from TOML) into a ClusterSchema for runtime use."""
+    field_defs = {}
+    for name, f in s_cfg.fields.items():
+        desc = f.type
+        if f.description:
+            desc += f" | {f.description}"
+        if f.validation:
+            desc += f" | validation:{f.validation}"
+        if f.enum:
+            desc += f" | enum:{','.join(f.enum)}"
+        if f.min is not None or f.max is not None:
+            desc += f" | range:{f.min}-{f.max}"
+        field_defs[name] = desc
+    return ClusterSchema(
+        granularity="config",
+        rationale=f"Loaded from hierarchical config schema '{s_cfg.name}'",
+        schema_fields=field_defs,
+        parent_schema_id=s_cfg.parent_schema_id,
+        source="config"
+    )
+
+
+def execute_protected_schema_discovery(
+    cluster_id: int,
+    sample_chunks: List[Chunk],
+    cluster_cfg: ResolvedClusterConfig,
+    client: OpenAI,
+    cfg: HierarchicalConfig,
+    registry: Optional[SchemaRegistry] = None
+) -> Tuple[ClusterSchema, Optional[SchemaLevelConfig]]:
+    """Discover or load schema for a cluster.
+
+    Returns:
+        (ClusterSchema, Optional[SchemaLevelConfig]) — the runtime schema and the 
+        original schema-level config (if loaded from TOML) for validation.
+    """
+    log.info("  [SCHEMA] Resolving schema for cluster %d (%s)...", cluster_id, cluster_cfg.name)
+
+    # 1. Check for predefined schemas in TOML
+    predefined = cfg.get_schemas_for_cluster(cluster_id)
+    if predefined:
+        log.info("  [SCHEMA] Using %d predefined schema(s) from configuration.", len(predefined))
+        # Merge all predefined schemas into one runtime schema envelope
+        merged_fields = {}
+        for s in predefined:
+            merged_fields.update(s.fields)
+        # Create a synthetic SchemaLevelConfig for validation
+        synthetic_schema = SchemaLevelConfig(
+            name=f"merged_cluster_{cluster_id}",
+            cluster_id=cluster_id,
+            fields={k: v for s in predefined for k, v in s.fields.items()},
+            validation=predefined[0].validation if predefined else {},
+            extraction=predefined[0].extraction if predefined else {}
+        )
+        return _convert_config_schema_to_cluster_schema(synthetic_schema), synthetic_schema
+
+    # 2. Otherwise, perform LLM-driven discovery with genetic memory
+    sample_text = "\n\n---\n\n".join(c.text[:800] for c in sample_chunks)
+    error_feedback = ""
+
+    few_shot_text = ""
+    parent_schema_id = None
+    if cluster_cfg.enable_schema_evolution and registry:
+        try:
+            top_schemas = registry.get_top_schemas(cluster_id, cluster_cfg.schema_evolution_top_k)
+            if top_schemas:
+                few_shot_text = "\n\nHISTORICALLY SUCCESSFUL SCHEMAS FOR THIS CLUSTER:\n"
+                for i, s in enumerate(top_schemas):
+                    few_shot_text += f"\nTop Schema {i+1} (Score: {s['score']:.1f}, Gen {s['generation']}):\n"
+                    few_shot_text += json.dumps(s['schema'], indent=2) + "\n"
+                parent_schema_id = top_schemas[0]['schema_id'] if top_schemas else None
+                log.info("  [DNA] Using %d historical schemas as few-shot examples.", len(top_schemas))
+        except Exception as e:
+            log.warning("  [WARN] Failed to load historical schemas: %s", e)
+
+    for attempt in range(1, 5):
+        prompt = f"""Design a relational flat JSON database schema matching entities across these documents.
+SAMPLE METADATA TEXTS:
+{sample_text}
+{few_shot_text}
+TARGET GOAL: Extract roughly {cluster_cfg.target_features} comprehensive schema fields.
+CRITICAL: Output structural raw JSON conforming EXACTLY to the following specification.
+The 'schema_fields' element MUST be a flat key-value dictionary mapping field name to data type/description string. Do NOT use nested objects or list formats.
+If historical schemas are provided above, you may improve upon them (add missing fields, remove noise, adjust types).
+
+{{"granularity": "medium", "rationale": "Explanation of structural alignment", "schema_fields": {{"item_id": "string", "amount": "number"}}}}
+{error_feedback}"""
+
+        try:
+            log.info("    Schema discovery attempt %d/4...", attempt)
+            response = client.chat.completions.create(
+                model=cfg.pipeline.models.get("schema_model", "qwen2.5-vl:7b"),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                timeout=30
+            )
+            raw_content = _strip_fences(response.choices[0].message.content)
+            log.debug("    Raw response: %s...", raw_content[:200])
+            schema_dict = json.loads(raw_content)
+            schema_dict["parent_schema_id"] = parent_schema_id
+            schema_dict["source"] = "discovered"
+            schema = ClusterSchema.model_validate(schema_dict)
+            log.info("    [OK] Cluster %d schema established on attempt %d.", cluster_id, attempt)
+            return schema, None
+        except json.JSONDecodeError as e:
+            err_trace = f"JSON parse error: {str(e)[:150]}"
+            log.warning("    [WARN] Schema JSON parsing failure (Attempt %d): %s", attempt, err_trace)
+            error_feedback = f"\n\nPREVIOUS PARSING REJECTION TRACE: {err_trace}\nCRITICAL FIX: Output only valid JSON matching the specification exactly."
+        except ValidationError as e:
+            err_trace = f"Pydantic validation: {str(e)[:150]}"
+            log.warning("    [WARN] Schema validation failure (Attempt %d): %s", attempt, err_trace)
+            error_feedback = f"\n\nPREVIOUS VALIDATION ERROR: {err_trace}\nEnsure schema_fields is a flat dictionary, not nested."
+        except APITimeoutError as e:
+            log.warning("    [WARN] Schema discovery timeout (Attempt %d): %s", attempt, e)
+            error_feedback = f"\n\nPREVIOUS ERROR: API timeout. The model took too long to respond."
+        except Exception as e:
+            err_trace = str(e).replace('\n', ' ')[:180]
+            log.error("    [FAIL] Unexpected error in schema discovery (Attempt %d): %s", attempt, err_trace)
+            log.error(traceback.format_exc())
+            error_feedback = f"\n\nPREVIOUS ERROR: {err_trace}"
+
+    log.error("  [FAIL] Fatal: All schema discovery attempts failed for cluster %d. Using fallback.", cluster_id)
+    return ClusterSchema(
+        granularity="coarse",
+        rationale="Automatic fallback after all attempts failed.",
+        schema_fields={"unstructured_data_payload": "string"},
+        source="fallback"
+    ), None
+
+
+# ==============================================================================
+# SECTION 6: JIT_OPTIMIZATION_ENGINE (Dynamic Compute Router)
+# ==============================================================================
+
+class AITaskJITCompiler:
+    """
+    Wraps expensive LLM/AI tasks. Records feature representations (Embeddings) against truth values.
+    After 'warmup_jobs', it compiles the task into a rapid, deterministic XGBoost model.
+    Periodically samples the truth to detect drift and recalibrates if error tolerance is breached.
+    """
+    def __init__(self, task_name: str, task_type: str, warmup_jobs: int = 10, error_tolerance: float = 10.0):
+        self.task_name = task_name
+        self.task_type = task_type
+        self.warmup_jobs = warmup_jobs
+        self.error_tolerance = error_tolerance
+        self.history_X = []
+        self.history_y = []
+        self.model = None
+        self.label_mapping = {}
+        self.reverse_mapping = {}
+        self.is_active = False
+        self.calls = 0
+        self.failures = 0
+
+    def attempt_compile(self):
+        try:
+            X = np.vstack(self.history_X)
+            if self.task_type == "regressor":
+                self.model = xgb.XGBRegressor(n_estimators=50, max_depth=4, random_state=42)
+                y = np.array(self.history_y)
+                self.model.fit(X, y)
+                self.is_active = True
+                log.info("[JIT] ACTIVATED: [%s] -> XGBoost Regressor (%d samples).", self.task_name, len(self.history_y))
+            else:
+                unique_labels = list(set(self.history_y))
+                if len(unique_labels) < 2:
+                    log.warning("  [WARN] JIT [%s]: only 1 class, deferring compilation.", self.task_name)
+                    return
+
+                self.model = xgb.XGBClassifier(n_estimators=50, max_depth=4, random_state=42)
+                self.label_mapping = {l: i for i, l in enumerate(unique_labels)}
+                self.reverse_mapping = {i: l for i, l in enumerate(unique_labels)}
+                y = np.array([self.label_mapping[l] for l in self.history_y])
+                self.model.fit(X, y)
+                self.is_active = True
+                log.info("[JIT] ACTIVATED: [%s] -> XGBoost Classifier (%d samples).", self.task_name, len(self.history_y))
+        except Exception as e:
+            log.error("  [FAIL] JIT compilation failed for [%s]: %s", self.task_name, e)
+            log.error(traceback.format_exc())
+
+    def execute(self, X_input: np.ndarray, llm_fallback_fn: Callable) -> Tuple[Any, str]:
+        self.calls += 1
+
+        if not self.is_active:
+            try:
+                truth_value = llm_fallback_fn()
+                self.history_X.append(X_input)
+                self.history_y.append(truth_value)
+                if len(self.history_X) >= self.warmup_jobs:
+                    self.attempt_compile()
+                return truth_value, "Native AI Execution (Warmup)"
+            except Exception as e:
+                self.failures += 1
+                log.error("  [FAIL] JIT warmup execution failed [%s]: %s", self.task_name, e)
+                raise
+
+        if np.random.rand() < 0.10:
+            try:
+                truth_value = llm_fallback_fn()
+                pred_value = self._predict_internal(X_input)
+
+                drift_detected = False
+                if self.task_type == "regressor":
+                    error = abs(truth_value - pred_value)
+                    if error > self.error_tolerance: drift_detected = True
+                else:
+                    if truth_value != pred_value: drift_detected = True
+
+                if drift_detected:
+                    log.warning("[JIT] DRIFT DETECTED: [%s] recalibrating...", self.task_name)
+                    self.is_active = False
+                    self.history_X.append(X_input)
+                    self.history_y.append(truth_value)
+                    return truth_value, "Native AI Execution (JIT Recalibrating)"
+                else:
+                    self.history_X.append(X_input)
+                    self.history_y.append(truth_value)
+                    return pred_value, "JIT Compiled Execution (Validated)"
+            except Exception as e:
+                self.failures += 1
+                log.error("  [FAIL] JIT drift check failed [%s]: %s", self.task_name, e)
+                return self._predict_internal(X_input), "JIT Compiled Execution (Fallback)"
+
+        try:
+            return self._predict_internal(X_input), "JIT Compiled Execution"
+        except Exception as e:
+            self.failures += 1
+            log.error("  [FAIL] JIT prediction failed [%s]: %s", self.task_name, e)
+            truth_value = llm_fallback_fn()
+            return truth_value, "Native AI Execution (JIT Failure Fallback)"
+
+    def _predict_internal(self, X_input: np.ndarray) -> Any:
+        pred = self.model.predict(X_input.reshape(1, -1))[0]
+        if self.task_type == "regressor":
+            return float(pred)
+        else:
+            return self.reverse_mapping.get(int(pred), "Unknown Category")
+
+
+# ==============================================================================
+# SECTION 5: VERIFICATION_ENGINE (verifier.py)
+# ==============================================================================
+
+class PipelineVerifier:
+    def __init__(self, cross_encoder_model: str, embedder: SentenceTransformer, cfg: HierarchicalConfig):
+        log.info("[VERIFIER] Bootstrapping Verification Engine...")
+        try:
+            self.cross_encoder = CrossEncoder(cross_encoder_model)
+            self.embedder = embedder
+            self.db = duckdb.connect(database=':memory:')
+            self.cfg = cfg
+            log.info("  [OK] Cross-Encoder loaded.")
+        except Exception as e:
+            log.error("  [FAIL] Failed to initialize verification engine: %s", e)
+            raise
+
+        self.fidelity_jit = AITaskJITCompiler(
+            task_name="Cross-Encoder Semantic Fidelity",
+            task_type="regressor",
+            warmup_jobs=cfg.job.jit_warmup_jobs,
+            error_tolerance=cfg.job.jit_error_tolerance
+        )
+        self.fact_verification_failures = 0
+        self.fact_verification_successes = 0
+
+    def evaluate_extraction_fidelity(
+        self,
+        result: PageExtractionResult,
+        meta: MetaStateJSON,
+        schema: ClusterSchema,
+        page_text: str,
+        schema_level: Optional[SchemaLevelConfig] = None
+    ) -> Tuple[float, str]:
+        try:
+            expected_keys = set(schema.schema_fields.keys())
+            num_tables = len(result.tables)
+            num_rows = sum(len(t.rows) for t in result.tables)
+            feedback_buffer: List[str] = []
+
+            if num_rows == 0:
+                return (100.0, "Valid explicit empty layout verified.") if num_tables == 0 else (0.0, "Structural tables present with missing rows.")
+
+            # --- Schema-level validation (if config provided) ---
+            if schema_level:
+                validation_errors = self._validate_against_schema_config(result, schema_level)
+                if validation_errors:
+                    feedback_buffer.append(f"Schema Validation: {len(validation_errors)} errors")
+
+            def _expensive_cross_encoder_call():
+                semantic_scores = []
+                for table in result.tables:
+                    for row in table.rows:
+                        sentence = self._translate_row_to_sentence(row)
+                        if sentence:
+                            try:
+                                logit = self.cross_encoder.predict([(page_text, sentence)])[0]
+                                prob = 1 / (1 + math.exp(-logit))
+                                semantic_scores.append(prob)
+                            except Exception as e:
+                                log.warning("      [WARN] Cross-encoder scoring failed for a row: %s", e)
+                return float(np.mean(semantic_scores)) * 50.0 if semantic_scores else 0.0
+
+            raw_json_str = result.model_dump_json()
+            X_input = self.embedder.encode(raw_json_str)
+
+            fidelity_allocation, jit_status = self.fidelity_jit.execute(X_input, llm_fallback_fn=_expensive_cross_encoder_call)
+
+            if fidelity_allocation < 35.0:
+                feedback_buffer.append("Fidelity Degradation Watch: Low textual grounding.")
+            feedback_buffer.append(f"[{jit_status}]")
+
+            structural_densities = []
+            for table in result.tables:
+                for r in table.rows:
+                    populated_valid_keys = sum(1 for k in expected_keys if k in r and r[k] not in (None, "", "null"))
+                    structural_densities.append(populated_valid_keys / max(1, len(expected_keys)))
+            schema_allocation = (np.mean(structural_densities) * 30.0) if structural_densities else 0.0
+
+            # --- DuckDB SQL Compliance (fixed: use pandas DataFrames) ---
+            sql_successes = 0
+            for table in result.tables:
+                try:
+                    if table.rows:
+                        df = pd.DataFrame(table.rows)
+                        self.db.register("test_rows_view", df)
+                        self.db.sql("SELECT * FROM test_rows_view").fetchall()
+                        sql_successes += 1
+                except Exception as e:
+                    feedback_buffer.append(f"SQL Compliance Failure: {str(e).splitlines()[0][:100]}")
+
+            duckdb_allocation = (sql_successes / num_tables) * 20.0 if num_tables > 0 else 0.0
+
+            master_score = fidelity_allocation + schema_allocation + duckdb_allocation
+
+            retry_penalty = (meta.current_retry - 1) * 5
+            if retry_penalty > 0:
+                master_score -= retry_penalty
+                feedback_buffer.append(f"Retry Penalty (-{retry_penalty})")
+
+            return max(0.0, min(100.0, master_score)), " | ".join(feedback_buffer)
+        except Exception as e:
+            log.error("  [FAIL] Fidelity evaluation crashed: %s", e)
+            log.error(traceback.format_exc())
+            return 0.0, f"Evaluation error: {str(e)[:100]}"
+
+    def _validate_against_schema_config(self, result: PageExtractionResult, s_cfg: SchemaLevelConfig) -> List[str]:
+        """Validate extracted rows against schema-level constraints."""
+        errors = []
+        strict = s_cfg.validation.get("strict_types", False)
+        allow_extra = s_cfg.validation.get("allow_extra_fields", True)
+        expected_keys = set(s_cfg.fields.keys())
+
+        for table in result.tables:
+            for row in table.rows:
+                row_keys = set(row.keys())
+                if not allow_extra:
+                    extra = row_keys - expected_keys
+                    if extra:
+                        errors.append(f"Extra fields disallowed: {extra}")
+
+                for field_name, f_cfg in s_cfg.fields.items():
+                    if f_cfg.required and field_name not in row:
+                        errors.append(f"Missing required field: {field_name}")
+                        continue
+                    if field_name not in row:
+                        continue
+                    val = row[field_name]
+                    if val in (None, "", "null"):
+                        if f_cfg.required:
+                            errors.append(f"Required field '{field_name}' is empty")
+                        continue
+
+                    # Type checks
+                    if f_cfg.type == "integer":
+                        try:
+                            int(val)
+                        except (ValueError, TypeError):
+                            errors.append(f"'{field_name}' expected integer, got {type(val).__name__}")
+                    elif f_cfg.type == "number":
+                        try:
+                            float(val)
+                        except (ValueError, TypeError):
+                            errors.append(f"'{field_name}' expected number, got {type(val).__name__}")
+                    elif f_cfg.type == "string":
+                        if not isinstance(val, str):
+                            if strict:
+                                errors.append(f"'{field_name}' expected string, got {type(val).__name__}")
+                            else:
+                                row[field_name] = str(val)
+
+                    # Range checks
+                    if f_cfg.type in ("integer", "number") and f_cfg.min is not None:
+                        try:
+                            if float(val) < f_cfg.min:
+                                errors.append(f"'{field_name}' value {val} below minimum {f_cfg.min}")
+                        except (ValueError, TypeError):
+                            pass
+                    if f_cfg.type in ("integer", "number") and f_cfg.max is not None:
+                        try:
+                            if float(val) > f_cfg.max:
+                                errors.append(f"'{field_name}' value {val} above maximum {f_cfg.max}")
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Enum checks
+                    if f_cfg.enum and str(val) not in f_cfg.enum:
+                        errors.append(f"'{field_name}' value '{val}' not in enum {f_cfg.enum}")
+
+                    # Regex checks
+                    if f_cfg.validation and f_cfg.validation.startswith("regex:"):
+                        pattern = f_cfg.validation.split(":", 1)[1]
+                        if not re.match(pattern, str(val)):
+                            errors.append(f"'{field_name}' value '{val}' does not match regex {pattern}")
+
+                    # Max length
+                    if f_cfg.max_length and len(str(val)) > f_cfg.max_length:
+                        errors.append(f"'{field_name}' length {len(str(val))} exceeds max {f_cfg.max_length}")
+
+        return errors
+
+    def execute_cross_cluster_interrogation(self, clusters_data: Dict[str, Any]) -> Dict[str, Any]:
+        log.info("[CROSS] Initiating cross-cluster data interrogation...")
+        interrogation_results = {"relational_integrity_passed": True, "anomalies": []}
+        try:
+            all_tables: Dict[str, List[Dict[str, Any]]] = {}
+            for cid, c_info in clusters_data.items():
+                flat_rows = []
+                for record in c_info.get("extraction_records", []):
+                    for table in record.get("data", {}).get("tables", []):
+                        flat_rows.extend(table.get("rows", []))
+                all_tables[f"cluster_{cid}_rows"] = flat_rows
+
+            available_views = []
+            for t_name, rows in all_tables.items():
+                if rows:
+                    df = pd.DataFrame(rows)
+                    self.db.register(t_name, df)
+                    available_views.append(t_name)
+
+            if len(available_views) >= 2:
+                interrogation_results["reconciled_views"] = available_views
+                log.info("  [OK] Cross-referenced %d relational views.", len(available_views))
+        except Exception as e:
+            log.error("  [FAIL] Cross-cluster interrogation failed: %s", e)
+            log.error(traceback.format_exc())
+            interrogation_results["relational_integrity_passed"] = False
+            interrogation_results["anomalies"].append(f"Inter-cluster error: {str(e)}")
+        return interrogation_results
+
+    def _translate_row_to_sentence(self, row: Dict[str, Any]) -> str:
+        tokens = [f"The {k} is {v}." for k, v in row.items() if v and str(v).strip().lower() not in ("null", "none", "")]
+        return " ".join(tokens)
+
+    @retry_on_failure(max_retries=3, delay=1.0)
+    def _generate_question_from_row(self, row: Dict[str, Any], client: OpenAI, model_name: str) -> str:
+        facts = json.dumps(row, indent=2)
+        prompt = f"""You are a fact-checker. Given the following data row (in JSON), generate a single, concise question that this row answers. Only output the question, nothing else.
+
+Data row:
+{facts}
+
+Question:"""
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            timeout=15
+        )
+        question = response.choices[0].message.content.strip()
+        if not question:
+            question = f"What is the value for this data? {json.dumps(row)}"
+        return question
+
+    def verify_row_against_cluster(
+        self,
+        row: Dict[str, Any],
+        cluster_chunks: List[Chunk],
+        client: OpenAI,
+        model_name: str,
+        faiss_index: Optional[faiss.IndexFlatL2] = None,
+        chunk_map: Optional[List[Chunk]] = None
+    ) -> Tuple[bool, float, str]:
+        """Fact-check a row against cluster evidence.
+
+        Uses a cached FAISS index if provided to avoid rebuilding per row.
+        """
+        try:
+            question = self._generate_question_from_row(row, client, model_name)
+            if not question:
+                self.fact_verification_failures += 1
+                return False, 0.0, ""
+
+            q_emb = self.embedder.encode([question])[0]
+
+            if faiss_index is not None and chunk_map is not None:
+                _, idx = faiss_index.search(q_emb.reshape(1, -1), 1)
+                best_chunk = chunk_map[idx[0][0]]
+            else:
+                # Fallback: rebuild index (inefficient)
+                chunk_embs = np.vstack([c.embedding for c in cluster_chunks if c.embedding is not None])
+                if len(chunk_embs) == 0:
+                    self.fact_verification_failures += 1
+                    return False, 0.0, "No embeddings available for cluster."
+                index = faiss.IndexFlatL2(chunk_embs.shape[1])
+                index.add(chunk_embs)
+                _, idx = index.search(q_emb.reshape(1, -1), 1)
+                best_chunk = cluster_chunks[idx[0][0]]
+
+            evidence_text = best_chunk.text[:600]
+            fact_sentence = self._translate_row_to_sentence(row)
+            logit = self.cross_encoder.predict([(evidence_text, fact_sentence)])[0]
+            confidence = 1 / (1 + math.exp(-logit))
+            verified = confidence >= 0.5
+            if verified:
+                self.fact_verification_successes += 1
+            else:
+                self.fact_verification_failures += 1
+            return verified, float(confidence), evidence_text
+        except Exception as e:
+            self.fact_verification_failures += 1
+            log.warning("  [WARN] Fact verification error on row: %s", e)
+            return False, 0.0, f"Verification error: {str(e)[:100]}"
+
+
+# ==============================================================================
+# SECTION 7: AGENT_ORCHESTRATOR
+# ==============================================================================
+
+def init_execution_state_cache(cache_path: str):
+    try:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cache_path).write_text(GlobalCache().model_dump_json())
+        log.debug("Execution state cache initialized.")
+    except Exception as e:
+        log.warning("[WARN] Could not initialize cache: %s", e)
+
+
+def mutate_execution_state_cache(cache_path: str, is_failure: bool, error_msg: Optional[str] = None):
+    if not Path(cache_path).exists():
+        init_execution_state_cache(cache_path)
+    try:
+        cache = GlobalCache.model_validate_json(Path(cache_path).read_text())
+        cache.total_attempts += 1
+        if is_failure:
+            cache.total_parse_failures += 1
+            if error_msg:
+                cache.recent_errors.append(error_msg)
+                if len(cache.recent_errors) > cache.max_error_memory:
+                    cache.recent_errors.pop(0)
+        Path(cache_path).write_text(cache.model_dump_json())
+    except Exception as e:
+        log.debug("Cache mutation skipped: %s", e)
+
+
+def get_execution_state_cache(cache_path: str) -> GlobalCache:
+    if not Path(cache_path).exists():
+        init_execution_state_cache(cache_path)
+    try:
+        return GlobalCache.model_validate_json(Path(cache_path).read_text())
+    except Exception:
+        return GlobalCache()
+
+
+def _strip_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        segments = text.split("```")
+        text = segments[1] if len(segments) > 1 else text
+        if text.startswith("json"):
+            text = text[4:]
+    return text.strip()
+
+
+def _convert_pdf_page_to_b64_image(doc: fitz.Document, page_num: int, dpi: int) -> str:
+    """Convert a PDF page to a base64 PNG. Caller must ensure doc is open."""
+    try:
+        page = doc[page_num]
+        pixmap = page.get_pixmap(dpi=dpi)
+        try:
+            img_bytes = io.BytesIO(pixmap.tobytes("png"))
+            return base64.b64encode(img_bytes.getvalue()).decode("utf-8")
+        finally:
+            pixmap.close()
+    except Exception as e:
+        log.error("[FAIL] Failed to convert page %d to image: %s", page_num, e)
+        raise
+
+
+@retry_on_failure(max_retries=3, delay=2.0)
+def generate_cluster_checkpoint_summary(cluster_id: int, records: List[Dict], client: OpenAI, model_name: str) -> str:
+    if not records:
+        return "No extraction records yet."
+    sampled = json.dumps([r.get("data", {}).get("tables", []) for r in records[-3:]], indent=2)[:2000]
+    prompt = f"Write a concise 2-sentence analytical summary of the kind of data that was just extracted, based on this JSON snippet: {sampled}"
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        timeout=20
+    )
+    summary = response.choices[0].message.content.strip()
+    return summary
+
+
+PAGE_RESULT_SCHEMA = PageExtractionResult.model_json_schema()
+
+
+# ==============================================================================
+# MAIN PIPELINE ORCHESTRATOR
+# ==============================================================================
+
+def execute_pipeline_refinery():
+    """Main pipeline orchestrator with hierarchical configuration and comprehensive error handling."""
+    overall_start = time.time()
+    pipeline_errors = []
+
+    try:
+        log.info("=" * 60)
+        log.info("[START] INITIALIZING DOCUMENT REFINERY PIPELINE v2.0")
+        log.info("=" * 60)
+
+        # Load hierarchical configuration
+        try:
+            cfg = HierarchicalConfig("pipeline_config.toml")
+            log.info("[CONFIG] Pipeline '%s' v%s", cfg.pipeline.name, cfg.pipeline.version)
+            log.info("[CONFIG] Document: %s", cfg.pipeline.doc_path)
+        except Exception as e:
+            log.critical("[FAIL] Failed to load configuration: %s", e)
+            raise
+
+        # Initialize state cache
+        cache_path = cfg.pipeline.cache_path or str(Path(tempfile.gettempdir()) / "llm_refinery_cache.json")
+        init_execution_state_cache(cache_path)
+        log.info("[STATE] State cache initialized at %s", cache_path)
+
+        # Initialize API client
+        try:
+            client = OpenAI(base_url=cfg.pipeline.models.get("ollama_url", "http://localhost:11434/v1"), api_key="ollama")
+            log.info("[CLIENT] Ollama client initialized: %s", cfg.pipeline.models.get("ollama_url"))
+        except Exception as e:
+            log.critical("[FAIL] Failed to initialize Ollama client: %s", e)
+            raise
+
+        # Load models
+        log.info("[MODELS] Loading models...")
+        try:
+            embedder = SentenceTransformer(cfg.pipeline.models.get("embedding_model", "all-MiniLM-L6-v2"))
+            log.info("  [OK] Embedding model loaded: %s", cfg.pipeline.models.get("embedding_model"))
+        except Exception as e:
+            log.critical("[FAIL] Failed to load embedding model: %s", e)
+            raise
+
+        try:
+            verifier = PipelineVerifier(cfg.pipeline.models.get("cross_encoder_model"), embedder, cfg)
+            log.info("  [OK] Verification engine initialized.")
+        except Exception as e:
+            log.critical("[FAIL] Failed to initialize verifier: %s", e)
+            raise
+
+        # Initialize schema registry
+        registry = None
+        schema_db_path = Path(cfg.pipeline.schema_db_path or tempfile.gettempdir()) / "schema_registry.duckdb"
+        if cfg.job.enable_schema_evolution:
+            try:
+                registry = SchemaRegistry(schema_db_path)
+                log.info("  [OK] Schema registry initialized.")
+            except Exception as e:
+                log.warning("  [WARN] Schema registry failed, continuing without evolution: %s", e)
+                cfg.job.enable_schema_evolution = False
+
+        # ------------------------------------------------------------------
+        # STAGE 1: INGESTION
+        # ------------------------------------------------------------------
+        log.info("\n" + "=" * 60)
+        log.info("[STAGE 1] DOCUMENT INGESTION")
+        log.info("=" * 60)
+
+        try:
+            chunks = ingest_document(cfg.pipeline.doc_path)
+            if not chunks:
+                log.critical("[FAIL] No chunks extracted from document. Exiting.")
+                return
+        except FileNotFoundError:
+            log.critical("[FAIL] Document not found: %s", cfg.pipeline.doc_path)
+            pipeline_errors.append(f"File not found: {cfg.pipeline.doc_path}")
+            return
+        except Exception as e:
+            log.critical("[FAIL] Ingestion failed: %s", e)
+            log.critical(traceback.format_exc())
+            pipeline_errors.append(f"Ingestion error: {str(e)[:100]}")
+            return
+
+        # ------------------------------------------------------------------
+        # STAGE 2: EMBEDDING GENERATION
+        # ------------------------------------------------------------------
+        log.info("\n" + "=" * 60)
+        log.info("[STAGE 2] EMBEDDING GENERATION")
+        log.info("=" * 60)
+
+        try:
+            chunks = execute_embedding_generation(chunks, cfg.pipeline.models.get("embedding_model"))
+        except Exception as e:
+            log.critical("[FAIL] Embedding generation failed: %s", e)
+            pipeline_errors.append(f"Embedding error: {str(e)[:100]}")
+            return
+
+        # ------------------------------------------------------------------
+        # STAGE 3: MANIFOLD REDUCTION & CLUSTERING
+        # ------------------------------------------------------------------
+        log.info("\n" + "=" * 60)
+        log.info("[STAGE 3] DIMENSIONALITY REDUCTION & CLUSTERING")
+        log.info("=" * 60)
+
+        # Use a temporary resolved config for clustering (uses job defaults)
+        temp_cluster_cfg = ResolvedClusterConfig(ClusterLevelConfig(id=-1), cfg.job)
+
+        if len(chunks) < temp_cluster_cfg.umap_neighbors:
+            original = temp_cluster_cfg.umap_neighbors
+            temp_cluster_cfg.umap_neighbors = max(2, len(chunks) - 1)
+            log.warning("  [WARN] Adjusted umap_neighbors from %d to %d (not enough chunks)", original, temp_cluster_cfg.umap_neighbors)
+
+        try:
+            chunks = run_manifold_reduction(chunks, temp_cluster_cfg)
+        except Exception as e:
+            log.critical("[FAIL] UMAP reduction failed: %s", e)
+            pipeline_errors.append(f"UMAP error: {str(e)[:100]}")
+            return
+
+        try:
+            cluster_densities = generate_spatial_density_clusters(chunks, temp_cluster_cfg)
+            valid_clusters = [cid for cid in cluster_densities if cid != -1]
+            if not valid_clusters:
+                log.error("[FAIL] No valid clusters found. All points classified as noise.")
+                log.error("   Try adjusting hdbscan_min_cluster or hdbscan_min_samples in config.")
+                pipeline_errors.append("Clustering failed: all points are noise")
+                return
+        except Exception as e:
+            log.critical("[FAIL] Clustering failed: %s", e)
+            pipeline_errors.append(f"Clustering error: {str(e)[:100]}")
+            return
+
+        try:
+            sampled_cluster_map = isolate_medoid_samples(chunks, temp_cluster_cfg)
+        except Exception as e:
+            log.critical("[FAIL] Medoid sampling failed: %s", e)
+            pipeline_errors.append(f"Sampling error: {str(e)[:100]}")
+            return
+
+        # ------------------------------------------------------------------
+        # STAGE 4: SCHEMA DISCOVERY (per-cluster with hierarchy)
+        # ------------------------------------------------------------------
+        log.info("\n" + "=" * 60)
+        log.info("[STAGE 4] SCHEMA DISCOVERY & RESOLUTION")
+        log.info("=" * 60)
+
+        cluster_schemas: Dict[int, ClusterSchema] = {}
+        cluster_schema_configs: Dict[int, Optional[SchemaLevelConfig]] = {}
+        failed_clusters = []
+
+        for cid, samples in sampled_cluster_map.items():
+            cluster_cfg = cfg.get_cluster_config(cid)
+
+            if not cluster_cfg.enabled:
+                log.info("  [CLUSTER %d] Disabled by configuration, skipping.", cid)
+                continue
+
+            try:
+                log.info("  Resolving schema for cluster %d (%s)...", cid, cluster_cfg.name)
+                schema, s_level = execute_protected_schema_discovery(
+                    cid, samples, cluster_cfg, client, cfg, registry
+                )
+                cluster_schemas[cid] = schema
+                cluster_schema_configs[cid] = s_level
+                log.info("  [OK] Cluster %d schema: %s (source=%s), %d fields",
+                         cid, schema.granularity, schema.source, len(schema.schema_fields))
+            except Exception as e:
+                log.error("  [FAIL] Schema discovery crashed for cluster %d: %s", cid, e)
+                log.error(traceback.format_exc())
+                failed_clusters.append(cid)
+                cluster_schemas[cid] = ClusterSchema(
+                    granularity="coarse",
+                    rationale="Schema discovery crashed; using fallback.",
+                    schema_fields={"raw_text": "string"},
+                    source="fallback"
+                )
+                cluster_schema_configs[cid] = None
+
+        if failed_clusters:
+            log.warning("  [WARN] %d clusters used fallback schemas: %s", len(failed_clusters), failed_clusters)
+
+        # ------------------------------------------------------------------
+        # STAGE 5: VISION EXTRACTION (per-cluster with resolved config)
+        # ------------------------------------------------------------------
+        log.info("\n" + "=" * 60)
+        log.info("[STAGE 5] VISION-BASED EXTRACTION")
+        log.info("=" * 60)
+
+        master_payload: Dict[str, Any] = {"clusters": {}}
+        overall_scores = []
+        clusters_completed = 0
+        clusters_failed = 0
+
+        # Open PDF once for entire extraction phase
+        try:
+            if Path(cfg.pipeline.doc_path).suffix.lower() != ".pdf":
+                log.error("[FAIL] Vision extraction requires PDF input.")
+                pipeline_errors.append("Non-PDF input for vision extraction")
+                return
+            doc_handle = fitz.open(cfg.pipeline.doc_path)
+        except Exception as e:
+            log.error("[FAIL] Failed to open PDF for rendering: %s", e)
+            pipeline_errors.append(f"PDF open error: {str(e)[:100]}")
+            return
+
+        try:
+            for cid, schema in cluster_schemas.items():
+                cluster_cfg = cfg.get_cluster_config(cid)
+                if not cluster_cfg.enabled:
+                    continue
+
+                cluster_start = time.time()
+                log.info("\n" + "-" * 60)
+                log.info("[CLUSTER %d] Processing (%d/%d)", cid, clusters_completed + 1, len(cluster_schemas))
+                log.info("-" * 60)
+
+                try:
+                    cid_chunks = [c for c in chunks if c.cluster_id == cid]
+                    page_numbers = sorted(set(c.page_num for c in cid_chunks))
+                    log.info("  Pages to process: %d (pages %d-%d)", len(page_numbers), min(page_numbers), max(page_numbers))
+
+                    extraction_records_collector = []
+                    cumulative_tables = 0
+                    cumulative_rows = 0
+                    cluster_scores = []
+                    checkpoint_summaries = []
+                    pages_processed = 0
+                    pages_failed = 0
+
+                    schema_json_str = json.dumps(schema.schema_fields, indent=2)
+                    page_count_in_cluster = 0
+
+                    # Pre-build FAISS index for fact verification if enabled
+                    faiss_index = None
+                    chunk_map = None
+                    if cluster_cfg.enable_fact_verification:
+                        valid_embs = [c for c in cid_chunks if c.embedding is not None]
+                        if valid_embs:
+                            chunk_embs = np.vstack([c.embedding for c in valid_embs]).astype("float32")
+                            faiss_index = faiss.IndexFlatL2(chunk_embs.shape[1])
+                            faiss_index.add(chunk_embs)
+                            chunk_map = valid_embs
+
+                    for page_num in page_numbers:
+                        page_start = time.time()
+                        page_count_in_cluster += 1
+
+                        try:
+                            log.info("\n  [PAGE %d] (%d/%d)", page_num, page_count_in_cluster, len(page_numbers))
+
+                            img_b64 = _convert_pdf_page_to_b64_image(doc_handle, page_num, cluster_cfg.extract_dpi)
+
+                            page_chunks = [c for c in cid_chunks if c.page_num == page_num]
+                            page_context_text = page_chunks[0].text if page_chunks else ""
+
+                            best_page_result: Optional[PageExtractionResult] = None
+                            best_page_score = -1.0
+                            previous_score = 0.0
+                            previous_feedback = "Initial extraction attempt."
+
+                            for attempt in range(1, cluster_cfg.max_page_retries + 1):
+                                attempt_start = time.time()
+
+                                try:
+                                    cache_state = get_execution_state_cache(cache_path)
+                                    failure_rate = (cache_state.total_parse_failures / cache_state.total_attempts) \
+                                        if cache_state.total_attempts > 0 else 0.0
+
+                                    meta_state = MetaStateJSON(
+                                        cluster_id=cid, page_num=page_num,
+                                        current_retry=attempt, max_retries=cluster_cfg.max_page_retries,
+                                        cumulative_tables=cumulative_tables, cumulative_rows=cumulative_rows,
+                                        global_parse_failure_rate=failure_rate,
+                                        total_global_attempts=cache_state.total_attempts,
+                                        historical_errors_from_previous_calls=cache_state.recent_errors,
+                                        previous_score=previous_score, previous_feedback=previous_feedback
+                                    )
+
+                                    # Build prompt with schema-level and cluster-level injections
+                                    prompt_injections = []
+                                    if cluster_cfg.custom_prompt_injection:
+                                        prompt_injections.append(cluster_cfg.custom_prompt_injection)
+                                    s_cfg = cluster_schema_configs.get(cid)
+                                    if s_cfg and s_cfg.prompt_injection:
+                                        prompt_injections.append(s_cfg.prompt_injection)
+
+                                    injection_text = "\n\n".join(prompt_injections)
+
+                                    system_prompt = f"""You are a specialized vision-based data refinery engine. Extract tabular structural components from page images.
+TARGET EXTRACTION SCHEMA:
+{schema_json_str}
+
+You MUST output a JSON object that exactly matches the PageExtractionResult schema, containing 'reasoning' and a 'tables' list.
+Each table has 'table_name' and 'rows' (a list of flat dictionaries).
+Do not output raw rows without the envelope.
+
+EXECUTION TRACKING STATE:
+{meta_state.model_dump_json(indent=2)}
+
+ADDITIONAL CONTEXT:
+{injection_text}
+
+If previous score is low, adjust your extraction parsing strategy to capture values with stronger precision."""
+
+                                    log.debug("    Attempt %d/%d...", attempt, cluster_cfg.max_page_retries)
+
+                                    # Ollama-compatible JSON mode selection
+                                    api_kwargs = {
+                                        "model": cfg.pipeline.models.get("vision_model", "qwen2.5-vl:7b"),
+                                        "messages": [
+                                            {"role": "system", "content": system_prompt},
+                                            {"role": "user", "content": [
+                                                {"type": "image_url",
+                                                 "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                                                {"type": "text",
+                                                 "text": "Extract all structural rows matching the required schema."}
+                                            ]}
+                                        ],
+                                        "temperature": 0.02 + (attempt * 0.04),
+                                        "timeout": 60
+                                    }
+
+                                    if cfg.pipeline.ollama_json_mode == "json_schema":
+                                        api_kwargs["extra_body"] = {
+                                            "format": {
+                                                "type": "json_schema",
+                                                "json_schema": {
+                                                    "name": "page_extraction_result",
+                                                    "schema": PAGE_RESULT_SCHEMA
+                                                }
+                                            }
+                                        }
+                                    elif cfg.pipeline.ollama_json_mode == "json":
+                                        api_kwargs["response_format"] = {"type": "json_object"}
+                                    # else: legacy mode — no format enforcement
+
+                                    response = client.chat.completions.create(**api_kwargs)
+
+                                    raw_text = response.choices[0].message.content
+                                    parsed_result = PageExtractionResult.model_validate_json(raw_text)
+                                    mutate_execution_state_cache(cache_path, is_failure=False)
+
+                                    score, feedback = verifier.evaluate_extraction_fidelity(
+                                        parsed_result, meta_state, schema, page_context_text,
+                                        schema_level=cluster_schema_configs.get(cid)
+                                    )
+
+                                    attempt_time = time.time() - attempt_start
+                                    log.info("    [OK] Attempt %d: Score %.1f/100 (%.1fs) - %s",
+                                             attempt, score, attempt_time, feedback[:80])
+
+                                    if score > best_page_score:
+                                        best_page_score = score
+                                        best_page_result = parsed_result
+
+                                    if score >= cluster_cfg.target_score:
+                                        log.info("    [TARGET] Target score reached, stopping retries.")
+                                        break
+
+                                    previous_score = score
+                                    previous_feedback = feedback
+
+                                except ValidationError as e:
+                                    err_msg = f"Pydantic validation: {str(e)[:120]}"
+                                    log.warning("    [WARN] Validation error (Attempt %d): %s", attempt, err_msg)
+                                    mutate_execution_state_cache(cache_path, is_failure=True, error_msg=err_msg)
+                                    previous_score = 0.0
+                                    previous_feedback = f"Validation Error: {err_msg}"
+
+                                except (APITimeoutError, APIConnectionError) as e:
+                                    err_msg = f"API error: {str(e)[:100]}"
+                                    log.warning("    [WARN] API error (Attempt %d): %s", attempt, err_msg)
+                                    mutate_execution_state_cache(cache_path, is_failure=True, error_msg=err_msg)
+                                    time.sleep(2 * attempt)
+                                    previous_feedback = f"API Error: {err_msg}"
+
+                                except json.JSONDecodeError as e:
+                                    err_msg = f"JSON parse error: {str(e)[:120]}"
+                                    log.warning("    [WARN] JSON error (Attempt %d): %s", attempt, err_msg)
+                                    log.debug("    Raw content: %s", raw_text[:300] if 'raw_text' in dir() else 'N/A')
+                                    mutate_execution_state_cache(cache_path, is_failure=True, error_msg=err_msg)
+                                    previous_score = 0.0
+                                    previous_feedback = f"JSON Error: {err_msg}"
+
+                                except Exception as e:
+                                    err_msg = str(e).replace('\n', ' ')[:150]
+                                    log.error("    [FAIL] Unexpected error (Attempt %d): %s", attempt, err_msg)
+                                    log.error(traceback.format_exc())
+                                    mutate_execution_state_cache(cache_path, is_failure=True, error_msg=err_msg)
+                                    previous_score = 0.0
+                                    previous_feedback = f"Error: {err_msg}"
+
+                            if best_page_result:
+                                cumulative_tables += len(best_page_result.tables)
+                                for t in best_page_result.tables:
+                                    cumulative_rows += len(t.rows)
+                                extraction_records_collector.append({
+                                    "page_num": page_num,
+                                    "score_achieved": best_page_score,
+                                    "data": best_page_result.model_dump()
+                                })
+                                cluster_scores.append(best_page_score)
+                                pages_processed += 1
+                                page_time = time.time() - page_start
+                                log.info("  [OK] Page %d completed (best score: %.1f, %.1fs)", page_num, best_page_score, page_time)
+                            else:
+                                pages_failed += 1
+                                log.error("  [FAIL] Page %d FAILED after %d attempts", page_num, cluster_cfg.max_page_retries)
+                                pipeline_errors.append(f"Page {page_num} in cluster {cid} failed")
+
+                            if page_count_in_cluster % 5 == 0 or page_count_in_cluster == len(page_numbers):
+                                try:
+                                    summary = generate_cluster_checkpoint_summary(
+                                        cid, extraction_records_collector, client,
+                                        cfg.pipeline.models.get("schema_model", "qwen2.5-vl:7b")
+                                    )
+                                    checkpoint_summaries.append({
+                                        "page_checkpoint": page_count_in_cluster,
+                                        "summary": summary
+                                    })
+                                    log.info("    [CHECKPOINT] Summary generated (%d pages)", page_count_in_cluster)
+                                except Exception as e:
+                                    log.warning("    [WARN] Checkpoint summary failed: %s", e)
+
+                        except Exception as e:
+                            log.error("  [FAIL] Fatal error processing page %d: %s", page_num, e)
+                            log.error(traceback.format_exc())
+                            pages_failed += 1
+                            pipeline_errors.append(f"Page {page_num} processing crashed: {str(e)[:100]}")
+
+                    # ------------------------------------------------------------------
+                    # FACT VERIFICATION (optional, per-cluster)
+                    # ------------------------------------------------------------------
+                    verified_rows = 0
+                    total_rows = 0
+                    if cluster_cfg.enable_fact_verification and extraction_records_collector:
+                        log.info("\n  [FACT] Running fact verification on cluster %d...", cid)
+                        for record in extraction_records_collector:
+                            for table in record["data"]["tables"]:
+                                for row in table["rows"]:
+                                    total_rows += 1
+                                    try:
+                                        verified, confidence, evidence = verifier.verify_row_against_cluster(
+                                            row, cid_chunks, client,
+                                            cfg.pipeline.models.get("schema_model", "qwen2.5-vl:7b"),
+                                            faiss_index=faiss_index, chunk_map=chunk_map
+                                        )
+                                        row["fact_verified"] = verified
+                                        row["fact_confidence"] = round(confidence, 4)
+                                        row["source_evidence"] = evidence[:300]
+                                        if verified:
+                                            verified_rows += 1
+                                    except Exception as e:
+                                        log.debug("      Fact verification skipped for row: %s", e)
+                                        row["fact_verified"] = False
+                                        row["fact_confidence"] = 0.0
+                                        row["source_evidence"] = f"Verification error: {str(e)[:100]}"
+
+                        log.info("  [OK] Fact verification: %d/%d rows verified (%.1f%%)",
+                                 verified_rows, total_rows, 100*verified_rows/max(1,total_rows))
+
+                    # ------------------------------------------------------------------
+                    # CLUSTER FINALIZATION
+                    # ------------------------------------------------------------------
+                    avg_cluster_score = round(float(np.mean(cluster_scores)), 2) if cluster_scores else 0.0
+                    overall_scores.append(avg_cluster_score)
+                    final_summary = checkpoint_summaries[-1]["summary"] if checkpoint_summaries else "No summary generated."
+
+                    cluster_time = time.time() - cluster_start
+
+                    master_payload["clusters"][str(cid)] = {
+                        "status": "done",
+                        "heuristic_score": avg_cluster_score,
+                        "final_summary": final_summary,
+                        "checkpoint_summaries": checkpoint_summaries,
+                        "metadata": {
+                            "total_clustered_pages": cluster_densities.get(cid, 0),
+                            "pages_processed": pages_processed,
+                            "pages_failed": pages_failed,
+                            "processing_time_seconds": round(cluster_time, 1)
+                        },
+                        "schema_definition": schema.model_dump(),
+                        "extraction_records": extraction_records_collector
+                    }
+
+                    if cfg.job.enable_schema_evolution and registry and extraction_records_collector:
+                        try:
+                            schema_id = registry.generate_schema_id(cid, schema.parent_schema_id)
+                            registry.register_schema(
+                                schema_id, cid, schema, avg_cluster_score,
+                                cumulative_rows, cfg.pipeline.doc_path, schema.parent_schema_id
+                            )
+                        except Exception as e:
+                            log.warning("  [WARN] Schema registration failed: %s", e)
+
+                    clusters_completed += 1
+                    log.info("\n  [OK] Cluster %d COMPLETED: Score=%.1f, Pages=%d/%d, Rows=%d, Time=%.1fs",
+                             cid, avg_cluster_score, pages_processed, pages_processed+pages_failed,
+                             cumulative_rows, cluster_time)
+
+                except Exception as e:
+                    log.error("\n  [FAIL] Cluster %d FATAL ERROR: %s", cid, e)
+                    log.error(traceback.format_exc())
+                    clusters_failed += 1
+                    pipeline_errors.append(f"Cluster {cid} fatal error: {str(e)[:100]}")
+
+                    master_payload["clusters"][str(cid)] = {
+                        "status": "failed",
+                        "error": str(e)[:200],
+                        "heuristic_score": 0.0,
+                        "extraction_records": []
+                    }
+
+        finally:
+            # Ensure PDF is always closed
+            doc_handle.close()
+            log.info("[STAGE 5] PDF rendering handle closed.")
+
+        # ------------------------------------------------------------------
+        # STAGE 6: CROSS-CLUSTER INTERROGATION
+        # ------------------------------------------------------------------
+        log.info("\n" + "=" * 60)
+        log.info("[STAGE 6] CROSS-CLUSTER INTERROGATION")
+        log.info("=" * 60)
+
+        try:
+            global_reconciliation_report = verifier.execute_cross_cluster_interrogation(
+                master_payload["clusters"]
+            )
+            master_payload["global_reconciliation_report"] = global_reconciliation_report
+            if global_reconciliation_report.get("relational_integrity_passed"):
+                log.info("  [OK] Cross-cluster integrity check passed.")
+            else:
+                log.warning("  [WARN] Cross-cluster anomalies: %s", global_reconciliation_report.get("anomalies", []))
+        except Exception as e:
+            log.error("  [FAIL] Cross-cluster interrogation failed: %s", e)
+            log.error(traceback.format_exc())
+            pipeline_errors.append(f"Cross-cluster error: {str(e)[:100]}")
+            master_payload["global_reconciliation_report"] = {
+                "relational_integrity_passed": False,
+                "anomalies": [f"Interrogation failed: {str(e)[:100]}"]
+            }
+
+        # ------------------------------------------------------------------
+        # FINALIZE
+        # ------------------------------------------------------------------
+        overall_time = time.time() - overall_start
+        overall_pipeline_score = round(float(np.mean(overall_scores)), 2) if overall_scores else 0.0
+
+        master_payload["pipeline_summary"] = {
+            "overall_performance_score": overall_pipeline_score,
+            "clusters_total": len(cluster_schemas),
+            "clusters_completed": clusters_completed,
+            "clusters_failed": clusters_failed,
+            "target_score": cfg.job.target_score,
+            "fact_verification_enabled": cfg.job.enable_fact_verification,
+            "schema_evolution_enabled": cfg.job.enable_schema_evolution,
+            "total_processing_time_seconds": round(overall_time, 1),
+            "pipeline_errors": pipeline_errors if pipeline_errors else ["None"],
+            "error_log_path": str(cfg.pipeline.error_log_path or Path(tempfile.gettempdir()) / "refinery_errors.log")
+        }
+
+        try:
+            output_path = Path(cfg.pipeline.output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(master_payload, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            log.info("\n" + "=" * 60)
+            log.info("[DONE] PIPELINE COMPLETED SUCCESSFULLY")
+            log.info("=" * 60)
+            log.info("  Output: %s", cfg.pipeline.output_path)
+            log.info("  Overall Score: %.1f/100", overall_pipeline_score)
+            log.info("  Clusters: %d/%d completed", clusters_completed, len(cluster_schemas))
+            log.info("  Errors: %d", len(pipeline_errors))
+            log.info("  Total Time: %.1fs", overall_time)
+            log.info("  Error Log: %s", cfg.pipeline.error_log_path)
+            log.info("=" * 60)
+        except Exception as e:
+            log.critical("[FAIL] Failed to write output: %s", e)
+            log.critical(traceback.format_exc())
+
+        if pipeline_errors:
+            log.warning("\n[WARN] PIPELINE ERROR SUMMARY (%d errors):", len(pipeline_errors))
+            for i, err in enumerate(pipeline_errors[:10], 1):
+                log.warning("  %d. %s", i, err)
+            if len(pipeline_errors) > 10:
+                log.warning("  ... and %d more errors", len(pipeline_errors) - 10)
+
+    except Exception as e:
+        log.critical("\n" + "=" * 60)
+        log.critical("[CRASH] PIPELINE CRASHED WITH FATAL ERROR")
+        log.critical("=" * 60)
+        log.critical("Error: %s", e)
+        log.critical(traceback.format_exc())
+        log.critical("Full error log: %s", cfg.pipeline.error_log_path if 'cfg' in dir() else "unknown")
+        raise
+
+    finally:
+        log.info("\n[DONE] Full error log saved to: %s",
+                 cfg.pipeline.error_log_path if 'cfg' in dir() else Path(tempfile.gettempdir()) / "refinery_errors.log")
+
+
+if __name__ == "__main__":
+    try:
+        execute_pipeline_refinery()
+    except FileNotFoundError as fnf:
+        log.critical("[FAIL] File not found: %s", fnf)
+        log.critical("   Please check that your PDF exists at the path specified in pipeline_config.toml")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        log.warning("[WARN] Pipeline interrupted by user.")
+        sys.exit(130)
+    except Exception as e:
+        log.critical("[FAIL] Unhandled exception: %s", e)
+        log.critical(traceback.format_exc())
+        sys.exit(1)

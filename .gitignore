@@ -1,31 +1,11 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
+*.pyc
+*.pyo
+.env
+cache/
+output/
+logs/
 *.egg-info/
 dist/
 build/
-
-# Project outputs
-output/
-logs/
-cache/
-registry/
-*.json
-*.duckdb
-*.log
-
-# Inputs (don't commit client data)
-input/
-*.pdf
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+.DS_Store
