@@ -1,73 +1,80 @@
+# DocTabularize — Document Intelligence Refinery
 
-## How it works (step by step)
+**Advanced PDF Table & Structured Data Extraction Pipeline**  
+*Target-aware, self-improving, and verifiable extraction using vision LLMs + clustering*
+
+---
+
+## Overview
+
+DocTabularize is a sophisticated document intelligence system that automatically extracts structured tabular data from complex PDFs (invoices, financial reports, research papers, etc.). 
+
+It combines **computer vision**, **semantic clustering**, **LLM-powered schema discovery**, and **multi-stage verification** to achieve high accuracy even on challenging, unstructured documents.
+
+---
+
+## How It Works (Step by Step)
 
 1. **Ingestion**  
-   The PDF is opened and each page is read. Pages with very little text (fewer than 15 characters) are skipped.
+   PDF pages are extracted. Low-content pages (<15 characters) are automatically skipped.
 
-2. **Understanding the content**  
-   The text of every page is converted into a mathematical representation called an "embedding" (a list of numbers that captures the meaning). Pages with similar meaning are placed close together in a high-dimensional space.
+2. **Semantic Understanding**  
+   Every page is converted into embeddings using Sentence Transformers. Similar pages are grouped in vector space.
 
-3. **Grouping pages (clustering)**  
-   The pipeline finds dense groups of similar pages using an algorithm called HDBSCAN. Each group becomes a "cluster". Pages that don't belong to any group are marked as noise and ignored.
+3. **Intelligent Clustering**  
+   HDBSCAN clusters similar pages together. Noise pages are filtered out.
 
-4. **Deciding what to extract (schema discovery)**  
-   For each cluster, the pipeline reads a few representative pages and asks a language model: "What structured information could you find here?" The model suggests a list of fields (e.g., `item_description`, `price`, `quantity`). If the suggestion is invalid, the pipeline tries again up to four times.  
-   If you run the pipeline multiple times on similar documents, it remembers which schemas produced the best results and reuses them (like genetic improvement).
+4. **Schema Discovery**  
+   For each cluster, a language model analyzes representative samples and proposes an optimal JSON schema. The system remembers high-performing schemas across runs (genetic memory).
 
-5. **Extracting the data (vision model)**  
-   Each page of the cluster is converted into an image. The image and the suggested fields are sent to a vision-language model (Qwen2.5-VL) that "looks" at the page and returns the data in the correct format.  
-   The model is forced to produce valid JSON that matches the expected structure, avoiding garbled output.
+5. **Vision-Based Extraction**  
+   Pages are converted to high-resolution images and sent to a vision-language model (Qwen2.5-VL or compatible). Extraction is **target-score aware** — the model retries until it meets quality thresholds.
 
-6. **Verification**  
-   The extracted data is checked in three ways:
-   - **Semantic check:** A second model (Cross-Encoder) checks if the extracted values actually appear in or match the page text.
-   - **Structure check:** The pipeline verifies that all expected fields are present and not empty.
-   - **SQL check:** A small database engine (DuckDB) tries to store the data; if it fails, the extraction is considered invalid.
+6. **Multi-Layer Verification**  
+   - **Semantic fidelity** via Cross-Encoder  
+   - **Structural completeness**  
+   - **SQL compliance** (DuckDB)  
+   Each row receives confidence metadata.
 
-   A score (0–100) is calculated. If the score is below a target (default 85), the pipeline retries the page. After multiple retries, it picks the best result.
+7. **Optional Fact Verification**  
+   Cross-checks extracted facts against original document text.
 
-7. **Fact verification (optional)**  
-   If enabled, each extracted row is turned into a question (e.g., "How much was spent on Office Supplies?") and the pipeline looks for the answer in the original text. Only rows that are confirmed by the source text are marked as verified.
-
-8. **Cross-cluster reconciliation**  
-   If multiple clusters contain similar data (e.g., invoices and purchase orders), the pipeline attempts to cross-reference them using SQL joins to catch mismatches (like missing items or price differences).
+8. **Cross-Cluster Reconciliation**  
+   Attempts to link related data across different clusters.
 
 9. **Output**  
-   All extracted data is saved to `master_output.json`. The file also includes a summary of scores, any errors that occurred, and statistics about each cluster.
+   Rich JSON with per-page scores, row-level confidence, verification flags, and pipeline statistics.
+
+---
+
+## Features
+
+- **Modular & Production-Ready** architecture (`src/doctabularize`)
+- **Target-score aware extraction** with automatic retries
+- **Self-improving schema memory** (genetic evolution)
+- **Per-row confidence metadata**
+- **Support for local (Ollama) and OpenAI-compatible APIs**
+- **Highly configurable** via TOML
+- **Robust JSON parsing & recovery**
+
+---
 
 ## Requirements
 
-- Python 3.11 or newer
-- Ollama running locally with the model `qwen2.5-vl:7b` (or a compatible vision model; support for APIs and non-local models coming soon!)
-- The following Python packages (install with `pip install -r requirements.txt`):
+- Python 3.11+
+- Ollama (recommended for local use) with `qwen2.5-vl:7b`
+- See `requirements.txt` for full dependencies
 
+---
 
 ## Setup
-
-Clone the repo:
 
 ```bash
 git clone https://github.com/DomArruda/DocTabularize.git
 cd DocTabularize
-```
 
-Install the package in editable mode:
-
-```bash
+# Install in editable mode
 pip install -e .
-```
 
-Pull the model if you haven't already:
-
-```bash
+# Pull the vision model
 ollama pull qwen2.5-vl:7b
-```
-
-## Configuration
-
-All pipeline behavior is controlled via `pipeline_config.toml`. At minimum set your input and output paths:
-
-```toml
-[pipeline]
-doc_path = "input/your_document.pdf"
-output_path = "output/extraction.json
