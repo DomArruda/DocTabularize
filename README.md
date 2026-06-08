@@ -2,9 +2,16 @@
 
 This tool takes a PDF document, extracts the data inside, and organizes it into structured tables. It is designed to be reliable: it checks its own work, retries when something goes wrong, and learns from past runs to improve over time.
 
-## What it does (in simple terms)
 
-Imagine you have a stack of paper documents — invoices, reports, contracts. You want to turn them into an Excel spreadsheet without typing everything by hand. This pipeline acts like a careful assistant that:
+# Potential Use Cases
+
+- Turning unstructured data within documents into structured, tabular data.
+- Feature Generation across unstructured data for use in models that work best with Tabular data (e.g CATBoost)
+- Synthetic data generation for Fine-Tuning tasks. 
+
+## What it does
+
+An agent acts as an assistant that: 
 
 1. **Reads** the PDF and splits it into pages.
 2. **Groups** pages that talk about similar things (like all invoice pages together, all report pages together).
@@ -54,5 +61,5 @@ If a page is hard to read, the assistant tries again up to three times. If the w
 ## Requirements
 
 - Python 3.11 or newer
-- Ollama running locally with the model `qwen2.5-vl:7b` (or a compatible vision model)
+- Ollama running locally with the model `qwen2.5-vl:7b` (or a compatible vision model; support for APIs and non-local models coming soon!)
 - The following Python packages (install with `pip install -r requirements.txt`):
