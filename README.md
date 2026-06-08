@@ -1,35 +1,4 @@
-# DocTabularize
 
-Document Intelligence Refinery — unsupervised schema discovery and structured extraction from PDFs using UMAP, HDBSCAN, and vision-language models.
-
-<<<<<<< HEAD
-## Setup
-
-```bash
-pip install -e .
-```
-=======
-
-# Potential Use Cases
-
-- Turning unstructured data within documents into structured, tabular data.
-- Feature Generation across unstructured data for use in models that work best with Tabular data (e.g CATBoost)
-- Synthetic data generation for Fine-Tuning tasks. 
-
-## What it does
-
-An agent acts as an assistant that: 
->>>>>>> 168681aea7c662d59f8e533b0bfb14ecf9efca7c
-
-## Usage
-
-```bash
-python main.py
-```
-
-<<<<<<< HEAD
-Configure via `pipeline_config.toml`.
-=======
 ## How it works (step by step)
 
 1. **Ingestion**  
