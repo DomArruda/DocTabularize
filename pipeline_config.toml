@@ -22,7 +22,7 @@
 [pipeline]
 name = "document_refinery"
 version = "2.0.0"
-doc_path = "econ_data.pdf"
+doc_path = "examples/econ_data.pdf"
 output_path = "output/master_output.json"
 error_log_path = "logs/refinery_errors.log"
 cache_path = "cache/llm_refinery_cache.json"
