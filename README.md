@@ -70,6 +70,4 @@ All pipeline behavior is controlled via `pipeline_config.toml`. At minimum set y
 ```toml
 [pipeline]
 doc_path = "input/your_document.pdf"
-output_path = "output/extraction.json"
-```
->>>>>>> 168681aea7c662d59f8e533b0bfb14ecf9efca7c
+output_path = "output/extraction.json
