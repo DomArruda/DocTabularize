@@ -63,3 +63,35 @@ If a page is hard to read, the assistant tries again up to three times. If the w
 - Python 3.11 or newer
 - Ollama running locally with the model `qwen2.5-vl:7b` (or a compatible vision model; support for APIs and non-local models coming soon!)
 - The following Python packages (install with `pip install -r requirements.txt`):
+
+
+## Setup
+
+Clone the repo:
+
+```bash
+git clone https://github.com/DomArruda/DocTabularize.git
+cd DocTabularize
+```
+
+Install the package in editable mode:
+
+```bash
+pip install -e .
+```
+
+Pull the model if you haven't already:
+
+```bash
+ollama pull qwen2.5-vl:7b
+```
+
+## Configuration
+
+All pipeline behavior is controlled via `pipeline_config.toml`. At minimum set your input and output paths:
+
+```toml
+[pipeline]
+doc_path = "input/your_document.pdf"
+output_path = "output/extraction.json"
+```
