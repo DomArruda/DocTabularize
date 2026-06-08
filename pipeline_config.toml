@@ -1,0 +1,113 @@
+# ==============================================================================
+# CORE ENTERPRISE DOCUMENT INTELLIGENCE REFINERY v2.0
+# Hierarchical Configuration Specification
+# ==============================================================================
+# Resolution Order (lowest → highest precedence):
+#   1. Hard-coded system defaults
+#   2. [pipeline]  — Global infrastructure & I/O
+#   3. [job]       — Per-execution behavioral policy
+#   4. [[cluster]] — Per-cluster overrides (by cluster_id)
+#   5. [[schema]]  — OPTIONAL: Per-table guardrails (by schema_name)
+# ==============================================================================
+# NOTE: The [[schema]] section is ENTIRELY OPTIONAL.
+#       If omitted, the pipeline performs full LLM-driven schema discovery
+#       with genetic evolution and cross-encoder verification.
+#       Define schemas ONLY when you need hard production constraints
+#       (regex validation, enum enforcement, strict typing) on known clusters.
+# ==============================================================================
+
+# ============================================
+# PIPELINE LEVEL — Global Infrastructure
+# ============================================
+[pipeline]
+name = "document_refinery"
+version = "2.0.0"
+doc_path = "econ_data.pdf"
+output_path = "output/master_output.json"
+error_log_path = "logs/refinery_errors.log"
+cache_path = "cache/llm_refinery_cache.json"
+schema_db_path = "registry/schema_registry.duckdb"
+ollama_json_mode = "json"        # "json_schema" | "json" | "legacy"
+
+[pipeline.models]
+embedding_model = "all-MiniLM-L6-v2"
+cross_encoder_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+ollama_url = "http://localhost:11434/v1"
+schema_model = "qwen2.5vl:7b"
+vision_model = "qwen2.5vl:7b"
+
+[pipeline.logging]
+level = "INFO"
+format = "%(asctime)s [%(levelname)s] %(message)s"
+handlers = ["console", "file"]
+
+# ============================================
+# JOB LEVEL — Per-Execution Behavioral Policy
+# ============================================
+[job]
+target_score = 85.0
+max_page_retries = 3
+max_cluster_retries = 2
+enable_fact_verification = false
+enable_schema_evolution = true
+schema_evolution_top_k = 3
+
+[job.extraction]
+target_features = 8
+max_rows_per_cluster = 100
+max_tables_per_cluster = 5
+extract_dpi = 150
+
+[job.clustering]
+umap_components = 5
+umap_neighbors = 15
+umap_min_dist = 0.1
+hdbscan_min_cluster = 3
+hdbscan_min_samples = 2
+samples_per_cluster = 3
+
+[job.jit]
+sequential_jobs_before_jit = 10
+error_tolerance = 15.0
+
+# ============================================
+# CLUSTER LEVEL — Per-Cluster Overrides
+# ============================================
+# Use TOML array-of-tables syntax: [[cluster]]
+# Any omitted field inherits from [job] or [job.clustering]
+# Leave this section EMPTY for fully automatic clustering.
+
+# [[cluster]]
+# id = 0
+# name = "financial_tables"
+# enabled = true
+# granularity = "fine"
+# target_score = 92.0
+# extract_dpi = 200
+# enable_fact_verification = true
+# custom_prompt_injection = "Focus on precise numerical tabular data."
+
+# [[cluster]]
+# id = -1
+# name = "noise"
+# enabled = false
+
+# ============================================
+# SCHEMA LEVEL — OPTIONAL Production Guardrails
+# ============================================
+# ONLY define these if you want to OVERRIDE dynamic discovery
+# for a known cluster with strict validation rules.
+# If omitted, the pipeline uses LLM discovery + genetic evolution.
+#
+# [[schema]]
+# name = "invoice"
+# cluster_id = 0
+# enabled = true
+#
+# [schema.fields]
+# invoice_id = { type = "string", required = true, validation = 'regex:^[A-Z]{2}-\d{6}$' }
+# amount = { type = "number", required = true, min = 0 }
+#
+# [schema.validation]
+# allow_extra_fields = false
+# strict_types = true
