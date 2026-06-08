@@ -1,7 +1,11 @@
 """
+
+Minimal for WIP purposes and simplicity..... much more coming!
+
 Document Intelligence Refinery — v2.3
 Target-score-aware extraction + per-row confidence metadata
 """
+
 
 import os, io, json, math, base64, logging, traceback, sys, time, re
 from pathlib import Path
