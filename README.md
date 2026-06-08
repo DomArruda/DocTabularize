@@ -62,7 +62,7 @@ It combines **computer vision**, **semantic clustering**, **LLM-powered schema d
 ## Requirements
 
 - Python 3.11+
-- Ollama (recommended for local use) with `qwen2.5-vl:7b`
+- Ollama (recommended for local use) with `qwen2.5vl:7b`
 - See `requirements.txt` for full dependencies
 
 ---
