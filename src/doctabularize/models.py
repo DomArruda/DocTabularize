@@ -2,7 +2,7 @@
 Data models for Document Intelligence Refinery.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Any, Dict, List
 import numpy as np
 from .config import Config
@@ -33,7 +33,7 @@ class ExtractedPage:
     score: float
     tables: List[Dict[str, Any]]
     feedback: str
-
+    source_type: str = field(default="pdf")   # "pdf" or "text"
 
 # ==============================================================================
 # LLM CONNECTORS for OpenAI, Gemini, and OpenAI-compatible APIs (Ollama, vLLM, etc.)

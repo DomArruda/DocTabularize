@@ -28,8 +28,8 @@ def _strip_json(text: str) -> str:
 
 def discover_schema(cid: int, samples: List[Chunk], cfg: Config, client: OpenAI) -> DiscoveredSchema:
     from .models import Chunk  # avoid circular if needed
-    sample_text = "\n\n---\n\n".join(s.text[:800] for s in samples)
-    model = cfg.get("pipeline.models.schema_model", "qwen2.5-vl:7b")
+    sample_text = "\n\n---\n\n".join(s.text[:800] for s in samples) # join the first 800 chars of each chunk.
+    model = cfg.get("pipeline.models.schema_model", "qwen2.5vl:7b") # gets model from config and falls back to qwen2.5
     target = cfg.cluster_cfg(cid).get("target_features", 8)
 
     err_feedback = ""
