@@ -1,11 +1,11 @@
+# ingest.py - for actually ingesting the data, turning into chunks, embedding, etc.
+
+
 import logging
 from pathlib import Path
 from typing import List, Dict, Any
 import fitz
-import numpy as np
-from sentence_transformers import SentenceTransformer
 from contextlib import contextmanager
-from dataclasses import asdict
 
 from langchain_community.document_loaders import (
     TextLoader,
@@ -17,13 +17,10 @@ from langchain_community.document_loaders import (
 from langchain_core.documents import Document
 
 from .models import Chunk
-from openai import OpenAI
 from .config import Config
+from .embedder import Embedder
+
 cfg = Config("pipeline_config.toml")
-
-base_url = cfg.get("pipeline.models.ollama_url", "http://localhost:11434/v1")
-embedding_client = OpenAI(base_url=base_url, api_key=cfg.get("pipeline.models.api_key", "ollama"))
-
 
 log = logging.getLogger("DocTabularize")
 
@@ -38,6 +35,7 @@ def open_pdf(path: str):
 
 
 def _pdf_to_chunks(path: str) -> List[Chunk]:
+    """Your existing excellent page-level logic (keep this)."""
     p = Path(path)
     chunks = []
     with open_pdf(path) as doc:
@@ -122,60 +120,23 @@ def ingest(path: str) -> List[Chunk]:
         ]
         return chunks
 
-def embed(chunks: List[Chunk], model_name: str) -> List[Chunk]:
-    log.info("[EMBED] Loading %s...", model_name)
-    
-    # Get API configuration from config
-    base_url = cfg.get("pipeline.models.base_url") or cfg.get("pipeline.models.ollama_url")
-    api_key = cfg.get("pipeline.models.api_key", "ollama")
-    
-    # If we have a cloud base_url (like DeepInfra), use the API. 
-    # Otherwise, fall back to local SentenceTransformer.
-    if base_url and "localhost" not in base_url and "127.0.0.1" not in base_url:
-        try:
-            client = OpenAI(base_url=base_url, api_key=api_key)
-            log.info("[EMBED] Using API endpoint: %s", base_url)
-            
-            texts = [c.text for c in chunks]
-            all_embeddings = []
-            batch_size = 32 # Keep batches small to avoid API rate limits/payload errors
-            
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                log.info("[EMBED] Processing batch %d/%d...", i//batch_size + 1, (len(texts) - 1)//batch_size + 1)
-                
-                # Call the OpenAI-compatible embeddings endpoint
-                response = client.embeddings.create(
-                    model=model_name,
-                    input=batch,
-                    encoding_format="float" # As requested in your curl example
-                )
-                
-                # Extract embeddings from the response
-                batch_embs = [item.embedding for item in response.data]
-                all_embeddings.extend(batch_embs)
-            
-            # Convert list of lists to a single numpy array (matching local model output format)
-            embs = np.array(all_embeddings)
-            
-            for c, e in zip(chunks, embs):
-                c.embedding = e
-                
-            log.info("[EMBED] Done (%d vectors, dim=%d)", len(embs), embs.shape[1])
-            return chunks
-            
-        except Exception as e:
-            log.error("[EMBED] API call failed: %s. Falling back to local model.", e)
-    
-    # FALLBACK: Local SentenceTransformer execution
-    try:
-        from sentence_transformers import SentenceTransformer
-        log.info("[EMBED] Using local SentenceTransformer.")
-        model = SentenceTransformer(model_name)
-        embs = model.encode([c.text for c in chunks], batch_size=32, show_progress_bar=False)
-        for c, e in zip(chunks, embs):
-            c.embedding = e
-        log.info("[EMBED] Done (%d vectors, dim=%d)", len(embs), embs.shape[1])
-        return chunks
-    except ImportError:
-        log.error("[EMBED] sentence-transformers not installed and no API configured!")
+
+def embed(chunks: List[Chunk], embedder_or_model) -> List[Chunk]:
+    """
+    Embed chunks in place (sets chunk.embedding) and return the same list.
+
+    `embedder_or_model` may be:
+      - an Embedder instance (preferred — lets the pipeline share one backend
+        across ingest and the Verifier), or
+      - a model-name string, in which case a fresh Embedder is built from config.
+
+    All API-or-local routing now lives in embedder.Embedder. The local
+    SentenceTransformer is only loaded if the API path is unavailable or fails,
+    so an API-only run never downloads a model or imports torch.
+    """
+    embedder = (
+        embedder_or_model
+        if isinstance(embedder_or_model, Embedder)
+        else Embedder(embedder_or_model, cfg)
+    )
+    return embedder.embed_chunks(chunks)
