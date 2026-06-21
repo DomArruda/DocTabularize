@@ -161,6 +161,12 @@ class Verifier:
         self.embedder = embedder
         self.cfg = cfg or Config("pipeline_config.toml")
 
+        # A page is "genuinely empty" (and a no-row extraction is therefore
+        # valid) only if its text layer is below this many characters. Above it,
+        # a no-row extraction is treated as a miss, not a perfect empty page.
+        # Defaults to the same threshold ingest uses to emit a chunk (15).
+        self.min_content_chars = self.cfg.get("pipeline.scoring.min_content_chars", 15)
+
         self.db = duckdb.connect(":memory:")
 
         if self.cfg.get("pipeline.models.rerank_url"):
@@ -231,7 +237,18 @@ class Verifier:
         all_rows = [r for t in tables for r in t.get("rows", [])]
 
         if not all_rows:
-            return (100.0, "Empty page — valid.", tables) if not tables else (0.0, "Tables with no rows.", tables)
+            if tables:
+                # Tables present but every row was empty/dropped — a malformed
+                # extraction, not a valid page.
+                return 0.0, "Tables present but no rows.", tables
+            # No tables at all. This is a valid empty page ONLY if the page
+            # genuinely has no extractable content. A page with real text that
+            # produced nothing is an extraction miss — score it low so the retry
+            # loop is pushed to actually extract, instead of converging on empty
+            # (which used to score 100 and beat any partial extraction).
+            if len((page_text or "").strip()) < self.min_content_chars:
+                return 100.0, "Empty page — valid.", tables
+            return 0.0, "Page has text but nothing was extracted.", tables
 
         # Per-row semantic fidelity — batched into a single scoring call.
         sents = [
