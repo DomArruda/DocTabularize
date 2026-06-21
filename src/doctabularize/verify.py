@@ -1,5 +1,18 @@
 """
 Verification and fact-checking with per-row metadata.
+
+Embedding is delegated to embedder.Embedder (API-or-local, lazy local model).
+The Verifier no longer constructs or holds any embedding model itself.
+
+Pair scoring (_score_pairs) tries three backends, in order:
+  1. A dedicated reranker endpoint (DeepInfra-style POST /v1/inference/<model>,
+     configured via pipeline.models.rerank_url). A true cross-encoder; scores
+     come back already in [0, 1], so the 0.5 threshold in fact_check is valid
+     as-is. Preferred path.
+  2. Embedding cosine via the Embedder. A bi-encoder *approximation* of a
+     cross-encoder; the score scale differs from sigmoid(logit), so the 0.5
+     threshold may need recalibration in this mode.
+  3. Local CrossEncoder (sentence-transformers), loaded lazily.
 """
 
 import json
@@ -12,13 +25,78 @@ import numpy as np
 import faiss
 import pandas as pd
 import duckdb
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.cross_encoder import CrossEncoder
 from openai import OpenAI
 
 from .models import Chunk
+from .config import Config
+from .embedder import Embedder
 
 log = logging.getLogger("Refinery")
+
+
+def _sigmoid(x: float) -> float:
+    """Numerically stable sigmoid (the local cross-encoder emits raw logits)."""
+    x = float(x)
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _cosine_to_score(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Map cosine similarity into [0, 1] as a relevance proxy for the cosine path.
+    Negatives clamp to 0; this is *not* calibrated like sigmoid(cross_logit),
+    so thresholds tuned against the local cross-encoder may need adjusting.
+    """
+    a = np.asarray(a, dtype="float32")
+    b = np.asarray(b, dtype="float32")
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0.0:
+        return 0.0
+    cos = float(np.dot(a, b) / denom)
+    return max(0.0, min(1.0, cos))
+
+
+def _rerank_api(
+    url: str,
+    api_key: str,
+    pairs: List[Tuple[str, str]],
+    instruction: Optional[str] = None,
+    batch_size: int = 32,
+) -> List[float]:
+    """
+    Score (evidence, claim) pairs via a DeepInfra-style reranker endpoint:
+        POST <url>  {"queries": [...], "documents": [...]}  ->  {"scores": [...]}
+
+    queries/documents are aligned positionally (queries[i] scored against
+    documents[i]), which maps one pair to one score. We send query = claim
+    (the short thing being verified) and document = evidence (the passage).
+    Scores come back already in [0, 1], so no sigmoid is applied — only a
+    defensive clamp. Pairs are chunked to keep payloads small (page_text is
+    repeated per row in score_with_metadata).
+    """
+    import httpx
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    scores: List[float] = []
+    for i in range(0, len(pairs), batch_size):
+        batch = pairs[i:i + batch_size]
+        payload: Dict[str, Any] = {
+            "queries": [claim for _evidence, claim in batch],
+            "documents": [evidence for evidence, _claim in batch],
+        }
+        if instruction:
+            payload["instruction"] = instruction
+        resp = httpx.post(url, json=payload, headers=headers, timeout=60.0)
+        resp.raise_for_status()
+        batch_scores = resp.json().get("scores", [])
+        if len(batch_scores) != len(batch):
+            raise ValueError(
+                f"rerank returned {len(batch_scores)} scores for {len(batch)} pairs"
+            )
+        scores.extend(max(0.0, min(1.0, float(s))) for s in batch_scores)
+    return scores
 
 
 def extract_tables_from_text(raw_text: str, schema) -> List[Dict]:  # schema: DiscoveredSchema
@@ -69,11 +147,81 @@ def extract_tables_from_text(raw_text: str, schema) -> List[Dict]:  # schema: Di
 
 
 class Verifier:
-    def __init__(self, model_name: str, embedder: SentenceTransformer):
-        self.cross = CrossEncoder(model_name)
+    def __init__(
+        self,
+        cross_encoder_model: str,
+        embedder: Embedder,
+        cfg: Optional[Config] = None,
+    ):
+        # Cross-encoder is loaded lazily, only when we fall back to the local path.
+        self.cross_model_name = cross_encoder_model
+        self._cross = None  # type: ignore[var-annotated]
+
+        # Embedding is fully delegated to the shared Embedder.
         self.embedder = embedder
+        self.cfg = cfg or Config("pipeline_config.toml")
+
         self.db = duckdb.connect(":memory:")
-        log.info("[VERIFY] Cross-encoder loaded.")
+
+        if self.cfg.get("pipeline.models.rerank_url"):
+            log.info("[VERIFY] Using reranker endpoint for pair scoring.")
+        elif getattr(self.embedder, "use_api", False):
+            log.info("[VERIFY] Using API embedding cosine for pair scoring.")
+        else:
+            log.info("[VERIFY] Local mode — cross-encoder loads on first use.")
+
+    def _local_cross(self):
+        """Lazily load the local cross-encoder (only on the local scoring path)."""
+        if self._cross is None:
+            from sentence_transformers.cross_encoder import CrossEncoder
+            log.info("[VERIFY] Loading local cross-encoder %s ...", self.cross_model_name)
+            self._cross = CrossEncoder(self.cross_model_name)
+        return self._cross
+
+    def _score_pairs(self, pairs: List[Tuple[str, str]]) -> List[float]:
+        """
+        Score (evidence, claim) relevance in [0, 1] for each pair.
+
+        Backend order:
+          1. Reranker endpoint (pipeline.models.rerank_url) — true cross-encoder.
+          2. Embedding cosine via the Embedder — deduped before embedding.
+          3. Local CrossEncoder — logits through a sigmoid.
+        """
+        if not pairs:
+            return []
+        pairs = list(pairs)
+
+        # 1. Dedicated reranker endpoint (preferred — faithful cross-encoder).
+        rerank_url = self.cfg.get("pipeline.models.rerank_url")
+        if rerank_url:
+            api_key = self.cfg.get("pipeline.models.rerank_api_key") or self.cfg.get("pipeline.models.api_key", "ollama")
+            instruction = self.cfg.get("pipeline.models.rerank_instruction")
+            try:
+                return _rerank_api(rerank_url, api_key, pairs, instruction)
+            except Exception as e:
+                log.error("[VERIFY] Rerank API failed: %s. Falling back.", e)
+
+        # 2. Embedding cosine via the shared Embedder.
+        if getattr(self.embedder, "use_api", False):
+            try:
+                # Dedupe before embedding — in score_with_metadata the left side
+                # (page_text) repeats across every row.
+                uniq: Dict[str, Optional[np.ndarray]] = {}
+                for a, b in pairs:
+                    uniq.setdefault(a, None)
+                    uniq.setdefault(b, None)
+                texts = list(uniq.keys())
+                embs = self.embedder.encode(texts)
+                for t, e in zip(texts, embs):
+                    uniq[t] = e
+                return [_cosine_to_score(uniq[a], uniq[b]) for a, b in pairs]
+            except Exception as e:
+                log.error("[VERIFY] Cosine scoring failed: %s. Falling back to local cross-encoder.", e)
+
+        # 3. Local cross-encoder.
+        cross = self._local_cross()
+        logits = cross.predict(pairs)
+        return [_sigmoid(l) for l in logits]
 
     def score_with_metadata(self, tables: List[Dict], schema, page_text: str) -> Tuple[float, str, List[Dict]]:
         """
@@ -85,19 +233,15 @@ class Verifier:
         if not all_rows:
             return (100.0, "Empty page — valid.", tables) if not tables else (0.0, "Tables with no rows.", tables)
 
-        # Per-row semantic fidelity scores
-        row_scores = []
-        for r in all_rows:
-            sent = " ".join([f"The {k} is {v}." for k, v in r.items() if v and str(v).lower() not in ("null", "none", "")])
-            if sent:
-                try:
-                    logit = self.cross.predict([(page_text, sent)])[0]
-                    prob = 1 / (1 + math.exp(-logit))
-                    row_scores.append(prob)
-                except Exception:
-                    row_scores.append(0.0)
-            else:
-                row_scores.append(0.0)
+        # Per-row semantic fidelity — batched into a single scoring call.
+        sents = [
+            " ".join([f"The {k} is {v}." for k, v in r.items()
+                      if v and str(v).lower() not in ("null", "none", "")])
+            for r in all_rows
+        ]
+        pairs = [(page_text, s) for s in sents if s]
+        pair_scores = iter(self._score_pairs(pairs))
+        row_scores = [next(pair_scores) if s else 0.0 for s in sents]
 
         fidelity = (np.mean(row_scores) * 50.0) if row_scores else 0.0
 
@@ -160,18 +304,29 @@ class Verifier:
         try:
             facts = json.dumps({k: v for k, v in row.items() if not k.startswith("_")}, indent=2)
             prompt = f"Given this data row, generate one concise question it answers.\n\n{facts}\n\nQuestion:"
-            q = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], temperature=0.0, timeout=15).choices[0].message.content.strip()
+            q = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                timeout=15,
+            ).choices[0].message.content.strip()
+
+            # Index only chunks that actually have embeddings, and search against
+            # that same list so the returned id maps back correctly.
+            valid = [c for c in chunks if c.embedding is not None]
+            if not valid:
+                return False, 0.0, "no embedded chunks"
 
             q_emb = self.embedder.encode([q])[0]
-            embs = np.vstack([c.embedding for c in chunks if c.embedding is not None]).astype("float32")
+            embs = np.vstack([c.embedding for c in valid]).astype("float32")
             idx = faiss.IndexFlatL2(embs.shape[1])
             idx.add(embs)
-            _, ids = idx.search(q_emb.reshape(1, -1), 1)
-            evidence = chunks[ids[0][0]].text[:600]
+            _, ids = idx.search(np.asarray(q_emb, dtype="float32").reshape(1, -1), 1)
+            evidence = valid[ids[0][0]].text[:600]
 
-            sent = " ".join([f"The {k} is {v}." for k, v in row.items() if v and not k.startswith("_") and str(v).lower() not in ("null", "none", "")])
-            logit = self.cross.predict([(evidence, sent)])[0]
-            conf = 1 / (1 + math.exp(-logit))
+            sent = " ".join([f"The {k} is {v}." for k, v in row.items()
+                             if v and not k.startswith("_") and str(v).lower() not in ("null", "none", "")])
+            conf = self._score_pairs([(evidence, sent)])[0] if sent else 0.0
             return conf >= 0.5, float(conf), evidence
         except Exception as e:
             log.debug("Fact-check error: %s", e)
