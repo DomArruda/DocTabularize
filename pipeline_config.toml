@@ -30,11 +30,23 @@ schema_db_path = "registry/schema_registry.duckdb"
 ollama_json_mode = "json"        # "json_schema" | "json" | "legacy"
 
 [pipeline.models]
-embedding_model = "all-MiniLM-L6-v2"
+# Tell the code to use the OpenAI-compatible client for DeepInfra
+llm_provider = "compatible" 
+
+# Open API Compatible (DeepInfra base URL)
+base_url = "https://api.deepinfra.com/v1/openai"
+
+# DeepInfra API Key (Replace with your actual key starting with sk-)
+api_key = "put your own, please :)"
+
+# DeepInfra model names (Use HuggingFace IDs, not Ollama tags)
+schema_model = "google/gemma-4-26B-A4B-it"
+vision_model = "google/gemma-4-26B-A4B-it"
+
+# Local models (Unchanged)VVV
+embedding_model = "Qwen/Qwen3-Embedding-0.6B"
 cross_encoder_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-ollama_url = "http://localhost:11434/v1"
-schema_model = "qwen2.5vl:7b"
-vision_model = "qwen2.5vl:7b"
+ollama_json_mode = "json"
 
 [pipeline.logging]
 level = "INFO"
@@ -54,8 +66,8 @@ schema_evolution_top_k = 3
 
 [job.extraction]
 target_features = 8
-max_rows_per_cluster = 100
-max_tables_per_cluster = 5
+max_rows_per_cluster = 10
+max_tables_per_cluster = 3
 extract_dpi = 150
 
 [job.clustering]
