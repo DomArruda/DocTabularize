@@ -38,7 +38,6 @@ def open_pdf(path: str):
 
 
 def _pdf_to_chunks(path: str) -> List[Chunk]:
-    """Your existing excellent page-level logic (keep this)."""
     p = Path(path)
     chunks = []
     with open_pdf(path) as doc:
