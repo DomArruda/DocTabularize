@@ -14,11 +14,11 @@ from dataclasses import asdict
 
 import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
 import faiss
 
 from .config import Config
 from .ingest import ingest, embed, open_pdf
+from .embedder import Embedder
 from .cluster import clusterize, medoids
 from .schema import discover_schema, load_config_schema
 from .models import DiscoveredSchema, get_llm_client
@@ -54,8 +54,11 @@ def run():
     schema_model = cfg.get("pipeline.models.schema_model", "qwen2.5-vl:7b")
     json_mode    = cfg.get("pipeline.ollama_json_mode", "json")
 
-    embedder = SentenceTransformer(cfg.get("pipeline.models.embedding_model", "all-MiniLM-L6-v2"))
-    verifier = Verifier(cfg.get("pipeline.models.cross_encoder_model"), embedder)
+    # One embedding backend, shared by the embedding step and the Verifier.
+    # Embedder loads its local SentenceTransformer lazily, so nothing is pulled
+    # from the Hugging Face Hub when an API endpoint is configured.
+    embedder = Embedder(cfg.get("pipeline.models.embedding_model"), cfg)
+    verifier = Verifier(cfg.get("pipeline.models.cross_encoder_model"), embedder, cfg)
 
     mem = SchemaMemory(cfg.get("pipeline.cache_path", "cache/schema_memory.json") or "cache/schema_memory.json")
 
@@ -70,7 +73,7 @@ def run():
         log.error("No chunks extracted from %s. Exiting.", doc_path)
         return
 
-    chunks = embed(chunks, cfg.get("pipeline.models.embedding_model"))
+    chunks = embed(chunks, embedder)
 
     # === CLUSTERING ===
     stats = clusterize(chunks, cfg)
