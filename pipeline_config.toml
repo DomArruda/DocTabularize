@@ -38,15 +38,12 @@ base_url = "https://api.deepinfra.com/v1/openai"
 
 # DeepInfra API Key (Replace with your actual key starting with sk-)
 api_key = "put your own, please :)"
-
 # DeepInfra model names (Use HuggingFace IDs, not Ollama tags)
 schema_model = "google/gemma-4-26B-A4B-it"
 vision_model = "google/gemma-4-26B-A4B-it"
-
-# Local models (Unchanged)VVV
 embedding_model = "Qwen/Qwen3-Embedding-0.6B"
 cross_encoder_model = "Qwen/Qwen3-Reranker-0.6B"
-ollama_json_mode = "json"
+ollama_json_mode = "json" # Need to change this....
 
 [pipeline.logging]
 level = "INFO"
