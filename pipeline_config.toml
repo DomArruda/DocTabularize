@@ -45,7 +45,7 @@ vision_model = "google/gemma-4-26B-A4B-it"
 
 # Local models (Unchanged)VVV
 embedding_model = "Qwen/Qwen3-Embedding-0.6B"
-cross_encoder_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+cross_encoder_model = "Qwen/Qwen3-Reranker-0.6B"
 ollama_json_mode = "json"
 
 [pipeline.logging]
